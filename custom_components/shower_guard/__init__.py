@@ -1,10 +1,13 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 0.6.0
+# version: 1.0.0
 # note: Wires the Sensor Layer (humidity entity, optional presence entity)
-#       into Session Detection and the Decision Engine, and records every
-#       decision into a bounded DecisionLog. Still dry run — no actuator or
-#       HA script is invoked yet (see ADR-0001, roadmap v1.0).
+#       into Session Detection and the Decision Engine, records every
+#       decision into a bounded DecisionLog, and — when configured — calls
+#       the actuator (an HA script) on a decision change. The Decision
+#       Engine itself never references an actuator; only this wiring layer
+#       does (see ADR-0001). Omitting the actuator scripts keeps that side
+#       of the decision dry run (computed and logged only).
 # ---
 
 import logging
@@ -21,6 +24,8 @@ from .const import (
     CONF_HUMIDITY_THRESHOLD,
     CONF_MAX_SESSION_SECONDS,
     CONF_PRESENCE_SENSOR,
+    CONF_WATER_AVAILABLE_SCRIPT,
+    CONF_WATER_CUT_SCRIPT,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DECISION_LOG_SIZE,
     DEFAULT_HUMIDITY_THRESHOLD,
@@ -28,7 +33,7 @@ from .const import (
     DOMAIN,
     VERSION,
 )
-from .decision import DecisionEngine, DecisionLog
+from .decision import Decision, DecisionEngine, DecisionLog
 from .session import SessionDetector
 
 _LOGGER = logging.getLogger(__name__)
@@ -85,10 +90,44 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data[DOMAIN]["last_decision"] = None
     hass.data[DOMAIN]["presence"] = None  # None = no presence sensor / unknown
 
-    def _evaluate_and_record(now: datetime) -> None:
-        """Evaluate the Decision Engine and record the result (dry run —
-        logged only, no actuator call). Shared by the humidity and presence
-        callbacks so a presence change alone can trigger a re-evaluation."""
+    water_cut_script = domain_config.get(CONF_WATER_CUT_SCRIPT)
+    water_available_script = domain_config.get(CONF_WATER_AVAILABLE_SCRIPT)
+
+    async def _call_actuator(decision: Decision) -> None:
+        """Call the HA script (if configured) for the given decision. Never
+        references a specific device/platform — script entities only, per
+        ADR-0001. Missing script -> that side of the decision stays dry run."""
+        script_entity_id = (
+            water_cut_script if decision is Decision.WATER_CUT else water_available_script
+        )
+        if not script_entity_id:
+            _LOGGER.debug(
+                "Shower Guard: no actuator script configured for %s; dry run only",
+                decision.value,
+            )
+            return
+
+        try:
+            await hass.services.async_call(
+                "script", "turn_on", {"entity_id": script_entity_id}, blocking=False
+            )
+            _LOGGER.info(
+                "Shower Guard: called actuator script %s for %s",
+                script_entity_id,
+                decision.value,
+            )
+        except Exception:  # noqa: BLE001 - HA service calls can raise various errors
+            _LOGGER.exception(
+                "Shower Guard: failed to call actuator script %s for %s",
+                script_entity_id,
+                decision.value,
+            )
+
+    async def _evaluate_and_record(now: datetime) -> None:
+        """Evaluate the Decision Engine, record the result, and — on a
+        decision change — call the configured actuator script. Shared by the
+        humidity and presence callbacks so a presence change alone can
+        trigger a re-evaluation and actuation."""
         result = engine.evaluate(
             detector.state,
             detector.active_since,
@@ -99,12 +138,13 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         previous = hass.data[DOMAIN]["last_decision"]
         hass.data[DOMAIN]["last_decision"] = result
         if previous is None or result.decision != previous.decision:
-            _LOGGER.info("Shower Guard decision (dry run): %s", result)
+            _LOGGER.info("Shower Guard decision: %s", result)
+            await _call_actuator(result.decision)
 
     async def _handle_humidity_change(event) -> None:
         """Feed a new humidity reading through Session Detection and the
-        Decision Engine (dry run — logged only, no actuator call). Every
-        evaluation is recorded into the DecisionLog."""
+        Decision Engine. Every evaluation is recorded into the DecisionLog;
+        decision changes call the configured actuator script."""
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _IGNORED_STATES:
             return
@@ -125,7 +165,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         if change is not None:
             _LOGGER.info("Shower Guard: %s", change)
 
-        _evaluate_and_record(now)
+        await _evaluate_and_record(now)
 
     hass.data[DOMAIN]["remove_listener"] = async_track_state_change_event(
         hass, [humidity_sensor], _handle_humidity_change
@@ -147,7 +187,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 return
 
             hass.data[DOMAIN]["presence"] = presence
-            _evaluate_and_record(datetime.now())
+            await _evaluate_and_record(datetime.now())
 
         hass.data[DOMAIN]["remove_presence_listener"] = (
             async_track_state_change_event(

@@ -1,8 +1,8 @@
 # ---
 # purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
-#          -> DecisionLog wiring (v0.2/v0.3/v0.4), plus the optional presence
-#          sensor wiring (v0.6).
-# version: 0.6.0
+#          -> DecisionLog wiring (v0.2/v0.3/v0.4), the optional presence
+#          sensor wiring (v0.6), and the actuator script wiring (v1.0).
+# version: 1.0.0
 # ---
 
 import asyncio
@@ -28,8 +28,25 @@ from custom_components.shower_guard.decision import Decision
 from custom_components.shower_guard.session import SessionState
 
 
+class FakeServices:
+    """Spy for hass.services.async_call, recording every invocation."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def async_call(self, domain, service, service_data=None, blocking=False):
+        self.calls.append(
+            {
+                "domain": domain,
+                "service": service,
+                "service_data": service_data,
+                "blocking": blocking,
+            }
+        )
+
+
 def make_hass():
-    return SimpleNamespace(data={})
+    return SimpleNamespace(data={}, services=FakeServices())
 
 
 def patch_track_state_change(monkeypatch_target=shower_guard):
@@ -401,6 +418,151 @@ def test_no_presence_listener_when_not_configured():
     assert "remove_presence_listener" not in hass.data[DOMAIN]
 
 
+# ---------------------------------------------------------------------------
+# Actuator wiring (v1.0 — real HA script calls on a decision change)
+# ---------------------------------------------------------------------------
+
+def test_actuator_not_called_when_no_scripts_configured():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
+
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+    assert hass.services.calls == []
+
+
+def test_actuator_called_on_water_available_decision():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "water_available_script": "script.restore_water",
+                }
+            },
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
+
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+    assert hass.services.calls == [
+        {
+            "domain": "script",
+            "service": "turn_on",
+            "service_data": {"entity_id": "script.restore_water"},
+            "blocking": False,
+        }
+    ]
+
+
+def test_actuator_called_on_water_cut_decision():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_session_seconds": 0,
+                    "water_cut_script": "script.cut_water",
+                }
+            },
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    asyncio.run(captured["callback"](event))
+
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_CUT
+    assert hass.services.calls == [
+        {
+            "domain": "script",
+            "service": "turn_on",
+            "service_data": {"entity_id": "script.cut_water"},
+            "blocking": False,
+        }
+    ]
+
+
+def test_actuator_not_called_again_when_decision_unchanged():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "water_available_script": "script.restore_water",
+                }
+            },
+        )
+    )
+
+    for _ in range(3):
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+        asyncio.run(captured["callback"](event))
+
+    assert len(hass.services.calls) == 1
+
+
+def test_actuator_only_calls_configured_side():
+    """Only water_cut_script configured -> no call for WATER_AVAILABLE, but a
+    call is made once the decision flips to WATER_CUT."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                    "water_cut_script": "script.cut_water",
+                }
+            },
+        )
+    )
+
+    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    asyncio.run(humidity_callback(event))
+    assert hass.services.calls == []  # water_available_script not configured
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
+    asyncio.run(presence_callback(event))
+
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_CUT
+    assert hass.services.calls == [
+        {
+            "domain": "script",
+            "service": "turn_on",
+            "service_data": {"entity_id": "script.cut_water"},
+            "blocking": False,
+        }
+    ]
+
+
 if __name__ == "__main__":
     tests = [
         test_async_setup_without_config_is_noop,
@@ -420,6 +582,11 @@ if __name__ == "__main__":
         test_presence_absent_cuts_water_immediately_during_active_session,
         test_presence_callback_ignores_unknown_state,
         test_no_presence_listener_when_not_configured,
+        test_actuator_not_called_when_no_scripts_configured,
+        test_actuator_called_on_water_available_decision,
+        test_actuator_called_on_water_cut_decision,
+        test_actuator_not_called_again_when_decision_unchanged,
+        test_actuator_only_calls_configured_side,
     ]
     passed = 0
     failed = 0
