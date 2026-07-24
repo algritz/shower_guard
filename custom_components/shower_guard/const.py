@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 0.4.0
+# version: 0.5.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Session Detection
 # Humidity level (% RH) that triggers session start.
