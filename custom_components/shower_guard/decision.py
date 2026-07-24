@@ -2,12 +2,13 @@
 # purpose: Decision Engine layer — decides whether water should remain
 #          available. Actuator-agnostic per ADR-0001. Also includes
 #          DecisionLog, a bounded audit trail of evaluations (v0.4).
-# version: 0.6.0
+# version: 1.1.0
 # note:    Pure Python. No Home Assistant imports. Consumes Session Detection
-#          output (and, optionally, a presence reading) only — never raw
-#          sensor data. Safe to unit-test and replay. Dry run only:
-#          evaluations are computed and returned/logged by the caller — no
-#          actuator or HA script is invoked here.
+#          output (current humidity, and optionally a presence reading)
+#          only — never raw sensor state objects. Safe to unit-test and
+#          replay. ``evaluate()`` is a pure computation — this layer never
+#          calls an actuator or HA script itself (see ADR-0001; only the
+#          wiring layer in __init__.py does that).
 # ---
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from .const import DEFAULT_DECISION_LOG_SIZE, DEFAULT_MAX_SESSION_SECONDS
+from .const import DEFAULT_DECISION_LOG_SIZE, DEFAULT_MAX_HUMIDITY_DELTA
 from .session import SessionState
 
 
@@ -36,13 +37,19 @@ class DecisionResult:
     timestamp: datetime
     session_state: SessionState
     session_duration_seconds: float
+    humidity_delta: Optional[float] = None
 
     def __str__(self) -> str:
+        delta_str = (
+            f", delta={self.humidity_delta:.1f}pts"
+            if self.humidity_delta is not None
+            else ""
+        )
         return (
             f"[{self.timestamp.isoformat()}] "
             f"{self.decision.value.upper()} "
             f"(state={self.session_state.value}, "
-            f"duration={self.session_duration_seconds:.0f}s) — {self.reason}"
+            f"duration={self.session_duration_seconds:.0f}s{delta_str}) — {self.reason}"
         )
 
 
@@ -56,17 +63,34 @@ class DecisionEngine:
        an active session -> cut water immediately (unattended running
        shower). Ignored when ``presence`` is ``None`` (no presence sensor
        configured, or its state is unknown).
-    3. Session running longer than ``max_session_seconds`` -> cut water.
-    4. Otherwise -> water available.
+    3. Humidity has risen by ``max_humidity_delta`` or more above the current
+       baseline -> cut water. The baseline is the session-start reading, and
+       resets on every RESUMED event (see
+       ``SessionDetector.active_since_humidity``) so a sibling starting a
+       fresh shower during the cooldown window gets its own baseline rather
+       than inheriting the previous person's cumulative rise. A hot shower
+       generates steam quickly and gets capped sooner; a cold shower (little
+       humidity rise) is not penalized just for running long. Skipped when
+       ``humidity`` or ``active_since_humidity`` is unavailable.
+    4. Optional duration fallback: if ``max_session_seconds`` is configured
+       (not ``None``) and the session has run longer than it -> cut water.
+       Disabled by default. The wiring layer (__init__.py) only enables this
+       when no presence sensor is configured, since presence already catches
+       an unattended session precisely — this is the safety net for when it
+       doesn't exist and humidity never rises enough to trip policy 3.
+    5. Otherwise -> water available.
 
-    Dry run (v0.3): ``evaluate()`` is a pure computation. Callers are
-    responsible for logging or acting on the result — this layer never calls
-    an actuator or HA script (see ADR-0001; actuator wiring arrives in v1.0).
+    ``evaluate()`` is a pure computation. Callers are responsible for logging
+    or acting on the result — this layer never calls an actuator or HA script
+    (see ADR-0001).
     """
 
     def __init__(
-        self, max_session_seconds: float = DEFAULT_MAX_SESSION_SECONDS
+        self,
+        max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
+        max_session_seconds: Optional[float] = None,
     ) -> None:
+        self.max_humidity_delta = max_humidity_delta
         self.max_session_seconds = max_session_seconds
 
     def evaluate(
@@ -74,19 +98,30 @@ class DecisionEngine:
         session_state: SessionState,
         active_since: Optional[datetime],
         now: datetime,
+        humidity: Optional[float] = None,
+        active_since_humidity: Optional[float] = None,
         presence: Optional[bool] = None,
     ) -> DecisionResult:
         """
         Evaluate whether water should remain available.
 
         Args:
-            session_state: Current Session Detection state.
-            active_since:  Timestamp the current session began, or ``None``
-                            if idle (see ``SessionDetector.active_since``).
-            now:            Timestamp of this evaluation.
-            presence:       ``True``/``False`` if a presence sensor is
-                            configured and its state is known, otherwise
-                            ``None`` (no presence sensor, or state unknown).
+            session_state:          Current Session Detection state.
+            active_since:           Timestamp the current session began, or
+                                    ``None`` if idle (see
+                                    ``SessionDetector.active_since``). Used
+                                    only to compute ``session_duration_seconds``
+                                    for observability — it is not a cutoff
+                                    trigger.
+            now:                    Timestamp of this evaluation.
+            humidity:               Current humidity reading (% RH), if
+                                    known.
+            active_since_humidity:  Current baseline reading (see
+                                    ``SessionDetector.active_since_humidity``),
+                                    if known.
+            presence:               ``True``/``False`` if a presence sensor is
+                                    configured and its state is known,
+                                    otherwise ``None``.
         """
         if session_state is SessionState.IDLE or active_since is None:
             return DecisionResult(
@@ -108,7 +143,26 @@ class DecisionEngine:
                 session_duration_seconds=duration,
             )
 
-        if duration >= self.max_session_seconds:
+        delta = (
+            humidity - active_since_humidity
+            if humidity is not None and active_since_humidity is not None
+            else None
+        )
+
+        if delta is not None and delta >= self.max_humidity_delta:
+            return DecisionResult(
+                decision=Decision.WATER_CUT,
+                reason=(
+                    f"Humidity rose {delta:.1f} points since session start "
+                    f"(>= {self.max_humidity_delta:.1f})."
+                ),
+                timestamp=now,
+                session_state=session_state,
+                session_duration_seconds=duration,
+                humidity_delta=delta,
+            )
+
+        if self.max_session_seconds is not None and duration >= self.max_session_seconds:
             return DecisionResult(
                 decision=Decision.WATER_CUT,
                 reason=(
@@ -118,14 +172,16 @@ class DecisionEngine:
                 timestamp=now,
                 session_state=session_state,
                 session_duration_seconds=duration,
+                humidity_delta=delta,
             )
 
         return DecisionResult(
             decision=Decision.WATER_AVAILABLE,
-            reason="Session within allowed duration.",
+            reason="Humidity rise within allowed delta.",
             timestamp=now,
             session_state=session_state,
             session_duration_seconds=duration,
+            humidity_delta=delta,
         )
 
 

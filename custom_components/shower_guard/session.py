@@ -1,7 +1,7 @@
 # ---
 # purpose: Session Detection layer — determines when a shower session starts,
 #          continues, resumes, or ends based on humidity readings.
-# version: 0.3.0
+# version: 1.1.0
 # note:    Pure Python. No Home Assistant imports. Safe to unit-test and replay.
 # ---
 
@@ -76,6 +76,7 @@ class SessionDetector:
         self._state: SessionState = SessionState.IDLE
         self._cooldown_start: Optional[datetime] = None
         self._active_since: Optional[datetime] = None
+        self._active_since_humidity: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -94,6 +95,17 @@ class SessionDetector:
         compute session duration without duplicating Session Detection state.
         """
         return self._active_since
+
+    @property
+    def active_since_humidity(self) -> Optional[float]:
+        """
+        Humidity reading used as the current baseline: set on STARTED, reset
+        to the RESUMED reading (so a sibling starting a fresh shower during
+        the cooldown window gets its own baseline), or ``None`` if IDLE. Used
+        by the Decision Engine to compute humidity rise without duplicating
+        Session Detection state.
+        """
+        return self._active_since_humidity
 
     def update(self, humidity: float, now: datetime) -> Optional[StateChange]:
         """
@@ -129,6 +141,7 @@ class SessionDetector:
     ) -> Optional[StateChange]:
         if above:
             self._active_since = now
+            self._active_since_humidity = humidity
             return self._transition(SessionEvent.STARTED, SessionState.ACTIVE, humidity, now)
         return None
 
@@ -148,14 +161,19 @@ class SessionDetector:
         self, above: bool, humidity: float, now: datetime
     ) -> Optional[StateChange]:
         if above:
-            # Humidity recovered — session resumed.
+            # Humidity recovered — session resumed. Reset the humidity
+            # baseline so a sibling starting a fresh shower during the
+            # cooldown window gets its own baseline rather than inheriting
+            # the previous person's cumulative humidity rise.
             self._cooldown_start = None
+            self._active_since_humidity = humidity
             return self._transition(SessionEvent.RESUMED, SessionState.ACTIVE, humidity, now)
 
         elapsed = (now - self._cooldown_start).total_seconds()
         if elapsed >= self.cooldown_seconds:
             self._cooldown_start = None
             self._active_since = None
+            self._active_since_humidity = None
             return self._transition(SessionEvent.ENDED, SessionState.IDLE, humidity, now)
 
         return None

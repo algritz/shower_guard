@@ -1,13 +1,15 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 1.0.0
+# version: 1.1.0
 # note: Wires the Sensor Layer (humidity entity, optional presence entity)
 #       into Session Detection and the Decision Engine, records every
 #       decision into a bounded DecisionLog, and — when configured — calls
 #       the actuator (an HA script) on a decision change. The Decision
 #       Engine itself never references an actuator; only this wiring layer
 #       does (see ADR-0001). Omitting the actuator scripts keeps that side
-#       of the decision dry run (computed and logged only).
+#       of the decision dry run (computed and logged only). The optional
+#       duration fallback (max_session_seconds) is only enabled when no
+#       presence_sensor is configured.
 # ---
 
 import logging
@@ -22,6 +24,7 @@ from .const import (
     CONF_DECISION_LOG_SIZE,
     CONF_HUMIDITY_SENSOR,
     CONF_HUMIDITY_THRESHOLD,
+    CONF_MAX_HUMIDITY_DELTA,
     CONF_MAX_SESSION_SECONDS,
     CONF_PRESENCE_SENSOR,
     CONF_WATER_AVAILABLE_SCRIPT,
@@ -29,6 +32,7 @@ from .const import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DECISION_LOG_SIZE,
     DEFAULT_HUMIDITY_THRESHOLD,
+    DEFAULT_MAX_HUMIDITY_DELTA,
     DEFAULT_MAX_SESSION_SECONDS,
     DOMAIN,
     VERSION,
@@ -74,9 +78,21 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             CONF_COOLDOWN_SECONDS, DEFAULT_COOLDOWN_SECONDS
         ),
     )
+
+    presence_sensor = domain_config.get(CONF_PRESENCE_SENSOR)
+
+    # Duration fallback only applies when there's no presence sensor to catch
+    # an unattended session precisely — with one configured, the delta policy
+    # plus presence is sufficient and a duration cap would reintroduce the
+    # "cold shower" stiffness this policy was designed to avoid.
     engine = DecisionEngine(
-        max_session_seconds=domain_config.get(
-            CONF_MAX_SESSION_SECONDS, DEFAULT_MAX_SESSION_SECONDS
+        max_humidity_delta=domain_config.get(
+            CONF_MAX_HUMIDITY_DELTA, DEFAULT_MAX_HUMIDITY_DELTA
+        ),
+        max_session_seconds=(
+            None
+            if presence_sensor
+            else domain_config.get(CONF_MAX_SESSION_SECONDS, DEFAULT_MAX_SESSION_SECONDS)
         ),
     )
     decision_log = DecisionLog(
@@ -89,6 +105,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data[DOMAIN]["decision_log"] = decision_log
     hass.data[DOMAIN]["last_decision"] = None
     hass.data[DOMAIN]["presence"] = None  # None = no presence sensor / unknown
+    hass.data[DOMAIN]["last_humidity"] = None  # None = no humidity reading yet
 
     water_cut_script = domain_config.get(CONF_WATER_CUT_SCRIPT)
     water_available_script = domain_config.get(CONF_WATER_AVAILABLE_SCRIPT)
@@ -132,6 +149,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             detector.state,
             detector.active_since,
             now,
+            humidity=hass.data[DOMAIN]["last_humidity"],
+            active_since_humidity=detector.active_since_humidity,
             presence=hass.data[DOMAIN]["presence"],
         )
         decision_log.record(result)
@@ -160,6 +179,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             return
 
         now = datetime.now()
+        hass.data[DOMAIN]["last_humidity"] = humidity
 
         change = detector.update(humidity=humidity, now=now)
         if change is not None:
@@ -171,7 +191,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         hass, [humidity_sensor], _handle_humidity_change
     )
 
-    presence_sensor = domain_config.get(CONF_PRESENCE_SENSOR)
     if presence_sensor:
 
         async def _handle_presence_change(event) -> None:

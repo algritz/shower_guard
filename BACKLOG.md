@@ -1,7 +1,8 @@
 # Shower Guard — Backlog
 
-Features deferred beyond the current roadmap. All milestones through v1.0
-(Real Actuator) are complete — remaining work lives here until scheduled.
+Features deferred beyond the current roadmap. All milestones through v1.1
+(Humidity-Delta Cutoff) are complete — remaining work lives here until
+scheduled.
 
 ---
 
