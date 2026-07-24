@@ -1,7 +1,7 @@
 # ---
 # purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
-#          wiring (v0.2/v0.3, dry run).
-# version: 0.3.0
+#          -> DecisionLog wiring (v0.2/v0.3/v0.4).
+# version: 0.4.0
 # ---
 
 import asyncio
@@ -81,7 +81,29 @@ def test_async_setup_registers_state_listener():
     assert captured["entity_ids"] == ["sensor.bathroom_humidity"]
     assert hass.data[DOMAIN]["detector"].state is SessionState.IDLE
     assert hass.data[DOMAIN]["decision_engine"] is not None
+    assert hass.data[DOMAIN]["decision_log"] is not None
+    assert len(hass.data[DOMAIN]["decision_log"]) == 0
     assert hass.data[DOMAIN]["last_decision"] is None
+
+
+def test_async_setup_uses_custom_decision_log_size():
+    hass = make_hass()
+    patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "decision_log_size": 5,
+                }
+            },
+        )
+    )
+
+    decision_log = hass.data[DOMAIN]["decision_log"]
+    assert decision_log.max_entries == 5
 
 
 def test_async_setup_uses_custom_max_session_seconds():
@@ -245,11 +267,36 @@ def test_humidity_callback_records_water_cut_when_session_exceeds_limit():
     assert last_decision.decision is Decision.WATER_CUT
 
 
+# ---------------------------------------------------------------------------
+# DecisionLog wiring (v0.4 — every evaluation is recorded, not just changes)
+# ---------------------------------------------------------------------------
+
+def test_humidity_callback_records_every_evaluation_in_decision_log():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    decision_log = hass.data[DOMAIN]["decision_log"]
+
+    for state in ("80.0", "82.0", "60.0"):
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+        asyncio.run(captured["callback"](event))
+
+    assert len(decision_log) == 3
+    assert decision_log.last is hass.data[DOMAIN]["last_decision"]
+
+
 if __name__ == "__main__":
     tests = [
         test_async_setup_without_config_is_noop,
         test_async_setup_without_humidity_sensor_is_noop,
         test_async_setup_registers_state_listener,
+        test_async_setup_uses_custom_decision_log_size,
         test_async_setup_uses_custom_max_session_seconds,
         test_async_setup_uses_custom_threshold_and_cooldown,
         test_humidity_callback_feeds_detector,
@@ -258,6 +305,7 @@ if __name__ == "__main__":
         test_humidity_callback_ignores_missing_new_state,
         test_humidity_callback_records_water_available_decision,
         test_humidity_callback_records_water_cut_when_session_exceeds_limit,
+        test_humidity_callback_records_every_evaluation_in_decision_log,
     ]
     passed = 0
     failed = 0

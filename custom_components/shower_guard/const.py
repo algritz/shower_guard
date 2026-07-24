@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 0.3.0
+# version: 0.4.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # Session Detection
 # Humidity level (% RH) that triggers session start.
@@ -24,3 +24,8 @@ CONF_COOLDOWN_SECONDS = "cooldown_seconds"
 # Maximum time (seconds) a session may run before water is decided unavailable.
 DEFAULT_MAX_SESSION_SECONDS: float = 900.0  # 15 minutes
 CONF_MAX_SESSION_SECONDS = "max_session_seconds"
+
+# Decision Logging
+# Number of most recent Decision Engine evaluations to keep in memory.
+DEFAULT_DECISION_LOG_SIZE: int = 100
+CONF_DECISION_LOG_SIZE = "decision_log_size"
