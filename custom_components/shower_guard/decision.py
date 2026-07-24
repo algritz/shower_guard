@@ -2,11 +2,12 @@
 # purpose: Decision Engine layer — decides whether water should remain
 #          available. Actuator-agnostic per ADR-0001. Also includes
 #          DecisionLog, a bounded audit trail of evaluations (v0.4).
-# version: 0.4.0
+# version: 0.6.0
 # note:    Pure Python. No Home Assistant imports. Consumes Session Detection
-#          output only, never raw sensor data. Safe to unit-test and replay.
-#          Dry run only: evaluations are computed and returned/logged by the
-#          caller — no actuator or HA script is invoked here.
+#          output (and, optionally, a presence reading) only — never raw
+#          sensor data. Safe to unit-test and replay. Dry run only:
+#          evaluations are computed and returned/logged by the caller — no
+#          actuator or HA script is invoked here.
 # ---
 
 from __future__ import annotations
@@ -49,8 +50,14 @@ class DecisionEngine:
     """
     Decides whether water should remain available.
 
-    Policy: cut water once the current session has been running longer than
-    ``max_session_seconds``. Reinstate availability once the session ends.
+    Policies (checked in order):
+    1. No active session -> water available.
+    2. Presence configured and explicitly absent (``presence=False``) during
+       an active session -> cut water immediately (unattended running
+       shower). Ignored when ``presence`` is ``None`` (no presence sensor
+       configured, or its state is unknown).
+    3. Session running longer than ``max_session_seconds`` -> cut water.
+    4. Otherwise -> water available.
 
     Dry run (v0.3): ``evaluate()`` is a pure computation. Callers are
     responsible for logging or acting on the result — this layer never calls
@@ -67,6 +74,7 @@ class DecisionEngine:
         session_state: SessionState,
         active_since: Optional[datetime],
         now: datetime,
+        presence: Optional[bool] = None,
     ) -> DecisionResult:
         """
         Evaluate whether water should remain available.
@@ -76,6 +84,9 @@ class DecisionEngine:
             active_since:  Timestamp the current session began, or ``None``
                             if idle (see ``SessionDetector.active_since``).
             now:            Timestamp of this evaluation.
+            presence:       ``True``/``False`` if a presence sensor is
+                            configured and its state is known, otherwise
+                            ``None`` (no presence sensor, or state unknown).
         """
         if session_state is SessionState.IDLE or active_since is None:
             return DecisionResult(
@@ -87,6 +98,15 @@ class DecisionEngine:
             )
 
         duration = (now - active_since).total_seconds()
+
+        if presence is False:
+            return DecisionResult(
+                decision=Decision.WATER_CUT,
+                reason="No presence detected during an active session.",
+                timestamp=now,
+                session_state=session_state,
+                session_duration_seconds=duration,
+            )
 
         if duration >= self.max_session_seconds:
             return DecisionResult(

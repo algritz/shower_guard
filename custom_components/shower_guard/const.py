@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 0.5.0
+# version: 0.6.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # Session Detection
 # Humidity level (% RH) that triggers session start.
@@ -29,3 +29,8 @@ CONF_MAX_SESSION_SECONDS = "max_session_seconds"
 # Number of most recent Decision Engine evaluations to keep in memory.
 DEFAULT_DECISION_LOG_SIZE: int = 100
 CONF_DECISION_LOG_SIZE = "decision_log_size"
+
+# Presence Sensor (optional Sensor Layer input, see ADR-0001)
+# When configured, an active session with no presence detected cuts water
+# immediately, regardless of max_session_seconds.
+CONF_PRESENCE_SENSOR = "presence_sensor"
