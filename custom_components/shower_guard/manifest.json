@@ -1,7 +1,7 @@
 {
 	"domain": "shower_guard",
 	"name": "Shower Guard",
-	"version": "0.5.0",
+	"version": "0.6.0",
 	"documentation": "https://github.com/algritz/shower_guard",
 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
 	"dependencies": [],

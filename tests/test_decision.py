@@ -1,7 +1,7 @@
 # ---
-# purpose: Tests for the Decision Engine layer (v0.3, dry run) and
-#          DecisionLog (v0.4, decision logging).
-# version: 0.4.0
+# purpose: Tests for the Decision Engine layer (v0.3 dry run, v0.6 presence)
+#          and DecisionLog (v0.4, decision logging).
+# version: 0.6.0
 # ---
 
 import sys
@@ -80,6 +80,50 @@ def test_decision_result_str_is_readable():
 
 
 # ---------------------------------------------------------------------------
+# Presence (v0.6, optional)
+# ---------------------------------------------------------------------------
+
+def test_presence_absent_cuts_water_immediately():
+    """presence=False cuts water even well within max_session_seconds."""
+    engine = DecisionEngine(max_session_seconds=900)
+    result = engine.evaluate(
+        SessionState.ACTIVE, active_since=t(0), now=t(5), presence=False
+    )
+    assert result.decision is Decision.WATER_CUT
+    assert "presence" in result.reason.lower()
+
+
+def test_presence_present_falls_back_to_duration_policy():
+    """presence=True behaves the same as the default duration-only policy."""
+    engine = DecisionEngine(max_session_seconds=900)
+    within = engine.evaluate(
+        SessionState.ACTIVE, active_since=t(0), now=t(300), presence=True
+    )
+    exceeded = engine.evaluate(
+        SessionState.ACTIVE, active_since=t(0), now=t(900), presence=True
+    )
+    assert within.decision is Decision.WATER_AVAILABLE
+    assert exceeded.decision is Decision.WATER_CUT
+
+
+def test_presence_unknown_falls_back_to_duration_policy():
+    """presence=None (default — no sensor configured/unknown state) behaves
+    identically to the pre-v0.6 duration-only policy."""
+    engine = DecisionEngine(max_session_seconds=900)
+    result = engine.evaluate(SessionState.ACTIVE, active_since=t(0), now=t(300))
+    assert result.decision is Decision.WATER_AVAILABLE
+
+
+def test_presence_absent_but_idle_stays_water_available():
+    """No active session -> water available regardless of presence."""
+    engine = DecisionEngine(max_session_seconds=900)
+    result = engine.evaluate(
+        SessionState.IDLE, active_since=None, now=t(0), presence=False
+    )
+    assert result.decision is Decision.WATER_AVAILABLE
+
+
+# ---------------------------------------------------------------------------
 # DecisionLog (v0.4)
 # ---------------------------------------------------------------------------
 
@@ -130,6 +174,10 @@ if __name__ == "__main__":
         test_cooldown_exceeding_limit_water_cut,
         test_custom_max_session_seconds,
         test_decision_result_str_is_readable,
+        test_presence_absent_cuts_water_immediately,
+        test_presence_present_falls_back_to_duration_policy,
+        test_presence_unknown_falls_back_to_duration_policy,
+        test_presence_absent_but_idle_stays_water_available,
         test_decision_log_starts_empty,
         test_decision_log_records_entries_in_order,
         test_decision_log_evicts_oldest_beyond_max_entries,

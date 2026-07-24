@@ -1,7 +1,7 @@
 # Shower Guard — Backlog
 
 Features deferred beyond the next two active milestones.
-Current active milestones: **v0.5 (Replay Support)** and **v0.6 (Presence Sensor)**.
+Current active milestones: **v0.6 (Presence Sensor)** and **v1.0 (Real Actuator)**.
 
 ---
 
@@ -20,6 +20,15 @@ Current active milestones: **v0.5 (Replay Support)** and **v0.6 (Presence Sensor
 - **Target version:** Unscheduled — only if UI configuration becomes a goal.
 - **Notes:** `async_setup_entry`/`async_unload_entry` are already scaffolded in
   `__init__.py` for this future use.
+
+### Replay Engine — Presence Support
+- **Reason deferred:** v0.6 added presence as an optional input to
+  `DecisionEngine.evaluate()`, but `replay.py` still only replays
+  `(timestamp, humidity)` readings, to avoid changing its shipped signature.
+- **Target version:** Unscheduled — pick up if replaying presence-driven
+  scenarios becomes necessary for validation.
+- **Notes:** Would require a parallel presence-readings sequence (or a merged
+  reading type) fed into `DecisionEngine.evaluate(..., presence=...)`.
 
 ---
 

@@ -1,7 +1,8 @@
 # ---
 # purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
-#          -> DecisionLog wiring (v0.2/v0.3/v0.4).
-# version: 0.4.0
+#          -> DecisionLog wiring (v0.2/v0.3/v0.4), plus the optional presence
+#          sensor wiring (v0.6).
+# version: 0.6.0
 # ---
 
 import asyncio
@@ -32,17 +33,28 @@ def make_hass():
 
 
 def patch_track_state_change(monkeypatch_target=shower_guard):
-    """Replace async_track_state_change_event with a spy and return the capture dict."""
-    captured = {}
+    """Replace async_track_state_change_event with a spy and return the
+    capture dict. Supports multiple registrations (e.g. humidity + presence);
+    top-level keys reflect the most recent registration for backward
+    compatibility, while captured["registrations"] lists every call."""
+    captured = {"registrations": []}
 
     def fake_track(hass_arg, entity_ids, callback):
-        captured["hass"] = hass_arg
-        captured["entity_ids"] = entity_ids
-        captured["callback"] = callback
+        registration = {"hass": hass_arg, "entity_ids": entity_ids, "callback": callback}
+        captured["registrations"].append(registration)
+        captured.update(registration)
         return lambda: None
 
     monkeypatch_target.async_track_state_change_event = fake_track
     return captured
+
+
+def callback_for(captured, entity_id):
+    """Look up the registered callback for a specific entity_id."""
+    for registration in captured["registrations"]:
+        if entity_id in registration["entity_ids"]:
+            return registration["callback"]
+    raise AssertionError(f"No listener registered for {entity_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +96,8 @@ def test_async_setup_registers_state_listener():
     assert hass.data[DOMAIN]["decision_log"] is not None
     assert len(hass.data[DOMAIN]["decision_log"]) == 0
     assert hass.data[DOMAIN]["last_decision"] is None
+    assert hass.data[DOMAIN]["presence"] is None
+    assert len(captured["registrations"]) == 1  # no presence_sensor configured
 
 
 def test_async_setup_uses_custom_decision_log_size():
@@ -291,6 +305,102 @@ def test_humidity_callback_records_every_evaluation_in_decision_log():
     assert decision_log.last is hass.data[DOMAIN]["last_decision"]
 
 
+# ---------------------------------------------------------------------------
+# Presence sensor wiring (v0.6, optional)
+# ---------------------------------------------------------------------------
+
+def test_async_setup_registers_presence_listener_when_configured():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                }
+            },
+        )
+    )
+
+    assert len(captured["registrations"]) == 2
+    callback_for(captured, "binary_sensor.bathroom_presence")  # raises if missing
+
+
+def test_presence_absent_cuts_water_immediately_during_active_session():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                }
+            },
+        )
+    )
+
+    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+
+    # Shower starts — no presence info yet, so duration-based policy applies.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    asyncio.run(humidity_callback(event))
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+
+    # Presence sensor reports the room is now empty — immediate cut, even
+    # though max_session_seconds has not elapsed and no new humidity arrived.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
+    asyncio.run(presence_callback(event))
+
+    assert hass.data[DOMAIN]["presence"] is False
+    last_decision = hass.data[DOMAIN]["last_decision"]
+    assert last_decision.decision is Decision.WATER_CUT
+    assert "presence" in last_decision.reason.lower()
+
+
+def test_presence_callback_ignores_unknown_state():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                }
+            },
+        )
+    )
+
+    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="unknown")})
+    asyncio.run(presence_callback(event))
+
+    assert hass.data[DOMAIN]["presence"] is None
+
+
+def test_no_presence_listener_when_not_configured():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    assert len(captured["registrations"]) == 1
+    assert "remove_presence_listener" not in hass.data[DOMAIN]
+
+
 if __name__ == "__main__":
     tests = [
         test_async_setup_without_config_is_noop,
@@ -306,6 +416,10 @@ if __name__ == "__main__":
         test_humidity_callback_records_water_available_decision,
         test_humidity_callback_records_water_cut_when_session_exceeds_limit,
         test_humidity_callback_records_every_evaluation_in_decision_log,
+        test_async_setup_registers_presence_listener_when_configured,
+        test_presence_absent_cuts_water_immediately_during_active_session,
+        test_presence_callback_ignores_unknown_state,
+        test_no_presence_listener_when_not_configured,
     ]
     passed = 0
     failed = 0
