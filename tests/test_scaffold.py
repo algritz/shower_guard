@@ -11,7 +11,13 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Stub homeassistant modules so tests run outside a live HA instance.
-for _mod in ("homeassistant", "homeassistant.core", "homeassistant.config_entries"):
+for _mod in (
+    "homeassistant",
+    "homeassistant.core",
+    "homeassistant.config_entries",
+    "homeassistant.helpers",
+    "homeassistant.helpers.event",
+):
     sys.modules.setdefault(_mod, MagicMock())
 
 
