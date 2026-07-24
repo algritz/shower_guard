@@ -14,7 +14,7 @@ import argparse
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from .const import (
     DEFAULT_COOLDOWN_SECONDS,
@@ -41,18 +41,22 @@ def replay(
     humidity_threshold: float = DEFAULT_HUMIDITY_THRESHOLD,
     cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
+    max_session_seconds: Optional[float] = None,
     decision_log_size: int = DEFAULT_DECISION_LOG_SIZE,
 ) -> ReplayResult:
     """
     Replay a sequence of ``(timestamp, humidity)`` readings, oldest first,
     through the exact same ``SessionDetector`` and ``DecisionEngine`` classes
     used in production (see ``__init__.py``). This is orchestration only — no
-    session or decision logic is reimplemented here.
+    session or decision logic is reimplemented here. ``max_session_seconds``
+    mirrors the optional duration fallback (disabled by default, ``None``).
     """
     detector = SessionDetector(
         humidity_threshold=humidity_threshold, cooldown_seconds=cooldown_seconds
     )
-    engine = DecisionEngine(max_humidity_delta=max_humidity_delta)
+    engine = DecisionEngine(
+        max_humidity_delta=max_humidity_delta, max_session_seconds=max_session_seconds
+    )
     result = ReplayResult(decision_log=DecisionLog(max_entries=decision_log_size))
 
     for now, humidity in readings:
@@ -105,6 +109,12 @@ def _main() -> None:
     parser.add_argument(
         "--max-humidity-delta", type=float, default=DEFAULT_MAX_HUMIDITY_DELTA
     )
+    parser.add_argument(
+        "--max-session-seconds",
+        type=float,
+        default=None,
+        help="Optional duration fallback (disabled by default).",
+    )
     args = parser.parse_args()
 
     readings = load_readings_from_csv(args.csv_file)
@@ -113,6 +123,7 @@ def _main() -> None:
         humidity_threshold=args.humidity_threshold,
         cooldown_seconds=args.cooldown_seconds,
         max_humidity_delta=args.max_humidity_delta,
+        max_session_seconds=args.max_session_seconds,
     )
 
     print(f"Replayed {len(readings)} readings.\n")

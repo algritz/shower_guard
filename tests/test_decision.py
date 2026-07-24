@@ -1,6 +1,6 @@
 # ---
-# purpose: Tests for the Decision Engine layer (v1.1 humidity delta, v0.6
-#          presence) and DecisionLog (v0.4, decision logging).
+# purpose: Tests for the Decision Engine layer (v1.1 humidity delta + optional
+#          duration fallback, v0.6 presence) and DecisionLog (v0.4).
 # version: 1.1.0
 # ---
 
@@ -126,6 +126,83 @@ def test_cooldown_state_delta_still_evaluated():
     assert result.decision is Decision.WATER_CUT
 
 
+# ---------------------------------------------------------------------------
+# Optional duration fallback (disabled by default)
+# ---------------------------------------------------------------------------
+
+def test_duration_fallback_disabled_by_default():
+    """Without max_session_seconds, a long session with a low delta stays
+    available indefinitely — no implicit duration cap."""
+    engine = DecisionEngine(max_humidity_delta=15.0)
+    result = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(36000),
+        humidity=77.0,
+        active_since_humidity=75.0,
+    )
+    assert result.decision is Decision.WATER_AVAILABLE
+
+
+def test_duration_fallback_cuts_water_when_enabled():
+    """With max_session_seconds set, a low-delta session is still capped
+    once it runs past the configured duration."""
+    engine = DecisionEngine(max_humidity_delta=15.0, max_session_seconds=900)
+    result = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(900),
+        humidity=77.0,
+        active_since_humidity=75.0,
+    )
+    assert result.decision is Decision.WATER_CUT
+    assert "exceeded max duration" in result.reason.lower()
+
+
+def test_duration_fallback_does_not_trigger_before_limit():
+    """With max_session_seconds set, water stays available before the limit."""
+    engine = DecisionEngine(max_humidity_delta=15.0, max_session_seconds=900)
+    result = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(899),
+        humidity=77.0,
+        active_since_humidity=75.0,
+    )
+    assert result.decision is Decision.WATER_AVAILABLE
+
+
+def test_humidity_delta_takes_priority_over_duration_fallback():
+    """When both would trigger, the delta policy is evaluated first and its
+    reason wins."""
+    engine = DecisionEngine(max_humidity_delta=15.0, max_session_seconds=900)
+    result = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(900),
+        humidity=95.0,
+        active_since_humidity=75.0,
+    )
+    assert result.decision is Decision.WATER_CUT
+    assert "humidity rose" in result.reason.lower()
+
+
+def test_presence_absent_takes_priority_over_duration_fallback():
+    """presence=False still cuts immediately even with the duration fallback
+    configured and not yet elapsed."""
+    engine = DecisionEngine(max_humidity_delta=15.0, max_session_seconds=900)
+    result = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(5),
+        humidity=76.0,
+        active_since_humidity=75.0,
+        presence=False,
+    )
+    assert result.decision is Decision.WATER_CUT
+    assert "presence" in result.reason.lower()
+
+
 def test_decision_result_str_is_readable():
     """DecisionResult.__str__ includes decision, state, duration, and delta."""
     engine = DecisionEngine(max_humidity_delta=15.0)
@@ -246,6 +323,11 @@ if __name__ == "__main__":
         test_custom_max_humidity_delta,
         test_missing_humidity_data_has_no_cutoff,
         test_cooldown_state_delta_still_evaluated,
+        test_duration_fallback_disabled_by_default,
+        test_duration_fallback_cuts_water_when_enabled,
+        test_duration_fallback_does_not_trigger_before_limit,
+        test_humidity_delta_takes_priority_over_duration_fallback,
+        test_presence_absent_takes_priority_over_duration_fallback,
         test_decision_result_str_is_readable,
         test_presence_absent_cuts_water_immediately,
         test_presence_present_falls_back_to_humidity_delta_policy,

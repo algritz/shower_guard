@@ -28,6 +28,13 @@ CONF_COOLDOWN_SECONDS = "cooldown_seconds"
 DEFAULT_MAX_HUMIDITY_DELTA: float = 15.0
 CONF_MAX_HUMIDITY_DELTA = "max_humidity_delta"
 
+# Optional duration-based fallback (see ADR-0001). Only wired in when no
+# presence_sensor is configured — with a presence sensor, an unattended
+# session is already caught precisely; without one, this is the safety net
+# for a session whose humidity never rises enough to trip the delta policy.
+DEFAULT_MAX_SESSION_SECONDS: float = 900.0  # 15 minutes
+CONF_MAX_SESSION_SECONDS = "max_session_seconds"
+
 # Decision Logging
 # Number of most recent Decision Engine evaluations to keep in memory.
 DEFAULT_DECISION_LOG_SIZE: int = 100

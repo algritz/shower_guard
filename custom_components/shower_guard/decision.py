@@ -71,9 +71,14 @@ class DecisionEngine:
        than inheriting the previous person's cumulative rise. A hot shower
        generates steam quickly and gets capped sooner; a cold shower (little
        humidity rise) is not penalized just for running long. Skipped when
-       ``humidity`` or ``active_since_humidity`` is unavailable — in that
-       case the session has no time- or humidity-based cutoff.
-    4. Otherwise -> water available.
+       ``humidity`` or ``active_since_humidity`` is unavailable.
+    4. Optional duration fallback: if ``max_session_seconds`` is configured
+       (not ``None``) and the session has run longer than it -> cut water.
+       Disabled by default. The wiring layer (__init__.py) only enables this
+       when no presence sensor is configured, since presence already catches
+       an unattended session precisely — this is the safety net for when it
+       doesn't exist and humidity never rises enough to trip policy 3.
+    5. Otherwise -> water available.
 
     ``evaluate()`` is a pure computation. Callers are responsible for logging
     or acting on the result — this layer never calls an actuator or HA script
@@ -81,9 +86,12 @@ class DecisionEngine:
     """
 
     def __init__(
-        self, max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA
+        self,
+        max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
+        max_session_seconds: Optional[float] = None,
     ) -> None:
         self.max_humidity_delta = max_humidity_delta
+        self.max_session_seconds = max_session_seconds
 
     def evaluate(
         self,
@@ -147,6 +155,19 @@ class DecisionEngine:
                 reason=(
                     f"Humidity rose {delta:.1f} points since session start "
                     f"(>= {self.max_humidity_delta:.1f})."
+                ),
+                timestamp=now,
+                session_state=session_state,
+                session_duration_seconds=duration,
+                humidity_delta=delta,
+            )
+
+        if self.max_session_seconds is not None and duration >= self.max_session_seconds:
+            return DecisionResult(
+                decision=Decision.WATER_CUT,
+                reason=(
+                    f"Session exceeded max duration "
+                    f"({duration:.0f}s >= {self.max_session_seconds:.0f}s)."
                 ),
                 timestamp=now,
                 session_state=session_state,

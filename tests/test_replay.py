@@ -1,5 +1,6 @@
 # ---
-# purpose: Tests for the Replay Engine (v0.5, v1.1 humidity delta).
+# purpose: Tests for the Replay Engine (v0.5, v1.1 humidity delta + optional
+#          duration fallback).
 # version: 1.1.0
 # ---
 
@@ -73,6 +74,22 @@ def test_replay_water_cut_when_humidity_delta_exceeds_threshold():
     assert result.decision_log.last.decision is Decision.WATER_CUT
 
 
+def test_replay_duration_fallback_disabled_by_default():
+    """Without max_session_seconds, a low-delta reading stays available even
+    long after session start."""
+    readings = [(t(0), 75.0), (t(3600), 77.0)]
+    result = replay(readings, max_humidity_delta=15.0)
+
+    assert result.decision_log.last.decision is Decision.WATER_AVAILABLE
+
+
+def test_replay_duration_fallback_cuts_water_when_enabled():
+    readings = [(t(0), 75.0), (t(900), 77.0)]
+    result = replay(readings, max_humidity_delta=15.0, max_session_seconds=900)
+
+    assert result.decision_log.last.decision is Decision.WATER_CUT
+
+
 def test_replay_respects_custom_threshold_and_cooldown():
     readings = [(t(0), 60.0)]  # below default 75.0 threshold
     result = replay(readings, humidity_threshold=60.0)
@@ -132,6 +149,8 @@ if __name__ == "__main__":
         test_replay_full_session_lifecycle,
         test_replay_records_a_decision_per_reading,
         test_replay_water_cut_when_humidity_delta_exceeds_threshold,
+        test_replay_duration_fallback_disabled_by_default,
+        test_replay_duration_fallback_cuts_water_when_enabled,
         test_replay_respects_custom_threshold_and_cooldown,
         test_replay_decision_log_respects_size_limit,
         test_load_readings_from_csv,

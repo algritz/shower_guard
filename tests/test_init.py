@@ -1,8 +1,9 @@
 # ---
 # purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
 #          -> DecisionLog wiring (v0.2/v0.3/v0.4), the optional presence
-#          sensor wiring (v0.6), the actuator script wiring (v1.0), and the
-#          humidity-delta cutoff policy (v1.1).
+#          sensor wiring (v0.6), the actuator script wiring (v1.0), the
+#          humidity-delta cutoff policy (v1.1), and the optional duration
+#          fallback enabled only when no presence_sensor is configured.
 # version: 1.1.0
 # ---
 
@@ -116,6 +117,8 @@ def test_async_setup_registers_state_listener():
     assert hass.data[DOMAIN]["last_decision"] is None
     assert hass.data[DOMAIN]["presence"] is None
     assert len(captured["registrations"]) == 1  # no presence_sensor configured
+    # No presence_sensor -> duration fallback is enabled by default.
+    assert hass.data[DOMAIN]["decision_engine"].max_session_seconds == 900.0
 
 
 def test_async_setup_uses_custom_decision_log_size():
@@ -156,6 +159,49 @@ def test_async_setup_uses_custom_max_humidity_delta():
 
     engine = hass.data[DOMAIN]["decision_engine"]
     assert engine.max_humidity_delta == 5.0
+
+
+def test_async_setup_uses_custom_max_session_seconds_without_presence_sensor():
+    hass = make_hass()
+    patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_session_seconds": 60,
+                }
+            },
+        )
+    )
+
+    engine = hass.data[DOMAIN]["decision_engine"]
+    assert engine.max_session_seconds == 60
+
+
+def test_presence_sensor_disables_duration_fallback():
+    """Configuring a presence_sensor disables the duration fallback, even if
+    max_session_seconds is also set — presence already handles it precisely."""
+    hass = make_hass()
+    patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                    "max_session_seconds": 60,
+                }
+            },
+        )
+    )
+
+    engine = hass.data[DOMAIN]["decision_engine"]
+    assert engine.max_session_seconds is None
 
 
 def test_async_setup_uses_custom_threshold_and_cooldown():
@@ -601,8 +647,8 @@ def test_humidity_delta_cuts_water_quickly_via_wiring():
 
 
 def test_cold_shower_stays_available_indefinitely_below_delta():
-    """A low humidity-delta reading stays available indefinitely — there is
-    no duration-based fallback; addresses the 'cold shower' case."""
+    """A low humidity-delta reading stays available well within the default
+    duration fallback (900s) — addresses the 'cold shower' case."""
     hass = make_hass()
     captured = patch_track_state_change()
 
@@ -669,6 +715,65 @@ def test_sibling_shower_gets_fresh_baseline_after_resume():
     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
 
 
+# ---------------------------------------------------------------------------
+# Duration fallback wiring (enabled only when no presence_sensor configured)
+# ---------------------------------------------------------------------------
+
+def test_duration_fallback_cuts_water_via_wiring_without_presence_sensor():
+    """With no presence_sensor and max_session_seconds=0, the very first
+    reading is cut via the duration fallback even with a tiny humidity delta."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_humidity_delta": 15.0,
+                    "max_session_seconds": 0,
+                }
+            },
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+    asyncio.run(captured["callback"](event))
+
+    last_decision = hass.data[DOMAIN]["last_decision"]
+    assert last_decision.decision is Decision.WATER_CUT
+    assert "exceeded max duration" in last_decision.reason.lower()
+
+
+def test_duration_fallback_disabled_via_wiring_with_presence_sensor():
+    """The same max_session_seconds=0 has no effect once a presence_sensor is
+    configured — the duration fallback is disabled in favor of presence."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                    "max_humidity_delta": 15.0,
+                    "max_session_seconds": 0,
+                }
+            },
+        )
+    )
+
+    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+    asyncio.run(humidity_callback(event))
+
+    last_decision = hass.data[DOMAIN]["last_decision"]
+    assert last_decision.decision is Decision.WATER_AVAILABLE
+
+
 if __name__ == "__main__":
     tests = [
         test_async_setup_without_config_is_noop,
@@ -676,6 +781,8 @@ if __name__ == "__main__":
         test_async_setup_registers_state_listener,
         test_async_setup_uses_custom_decision_log_size,
         test_async_setup_uses_custom_max_humidity_delta,
+        test_async_setup_uses_custom_max_session_seconds_without_presence_sensor,
+        test_presence_sensor_disables_duration_fallback,
         test_async_setup_uses_custom_threshold_and_cooldown,
         test_humidity_callback_feeds_detector,
         test_humidity_callback_ignores_unavailable_state,
@@ -696,6 +803,8 @@ if __name__ == "__main__":
         test_humidity_delta_cuts_water_quickly_via_wiring,
         test_cold_shower_stays_available_indefinitely_below_delta,
         test_sibling_shower_gets_fresh_baseline_after_resume,
+        test_duration_fallback_cuts_water_via_wiring_without_presence_sensor,
+        test_duration_fallback_disabled_via_wiring_with_presence_sensor,
     ]
     passed = 0
     failed = 0

@@ -7,7 +7,9 @@
 #       the actuator (an HA script) on a decision change. The Decision
 #       Engine itself never references an actuator; only this wiring layer
 #       does (see ADR-0001). Omitting the actuator scripts keeps that side
-#       of the decision dry run (computed and logged only).
+#       of the decision dry run (computed and logged only). The optional
+#       duration fallback (max_session_seconds) is only enabled when no
+#       presence_sensor is configured.
 # ---
 
 import logging
@@ -23,6 +25,7 @@ from .const import (
     CONF_HUMIDITY_SENSOR,
     CONF_HUMIDITY_THRESHOLD,
     CONF_MAX_HUMIDITY_DELTA,
+    CONF_MAX_SESSION_SECONDS,
     CONF_PRESENCE_SENSOR,
     CONF_WATER_AVAILABLE_SCRIPT,
     CONF_WATER_CUT_SCRIPT,
@@ -30,6 +33,7 @@ from .const import (
     DEFAULT_DECISION_LOG_SIZE,
     DEFAULT_HUMIDITY_THRESHOLD,
     DEFAULT_MAX_HUMIDITY_DELTA,
+    DEFAULT_MAX_SESSION_SECONDS,
     DOMAIN,
     VERSION,
 )
@@ -74,9 +78,21 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             CONF_COOLDOWN_SECONDS, DEFAULT_COOLDOWN_SECONDS
         ),
     )
+
+    presence_sensor = domain_config.get(CONF_PRESENCE_SENSOR)
+
+    # Duration fallback only applies when there's no presence sensor to catch
+    # an unattended session precisely — with one configured, the delta policy
+    # plus presence is sufficient and a duration cap would reintroduce the
+    # "cold shower" stiffness this policy was designed to avoid.
     engine = DecisionEngine(
         max_humidity_delta=domain_config.get(
             CONF_MAX_HUMIDITY_DELTA, DEFAULT_MAX_HUMIDITY_DELTA
+        ),
+        max_session_seconds=(
+            None
+            if presence_sensor
+            else domain_config.get(CONF_MAX_SESSION_SECONDS, DEFAULT_MAX_SESSION_SECONDS)
         ),
     )
     decision_log = DecisionLog(
@@ -175,7 +191,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         hass, [humidity_sensor], _handle_humidity_change
     )
 
-    presence_sensor = domain_config.get(CONF_PRESENCE_SENSOR)
     if presence_sensor:
 
         async def _handle_presence_change(event) -> None:

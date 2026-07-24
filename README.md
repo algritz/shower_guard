@@ -44,6 +44,7 @@ shower_guard:
   humidity_threshold: 75.0                            # optional — default 75.0
   cooldown_seconds: 300                               # optional — default 300 (5 min)
   max_humidity_delta: 15.0                             # optional — default 15.0 (percentage points RH)
+  max_session_seconds: 900                             # optional — default 900 (15 min); ignored if presence_sensor is set
   decision_log_size: 100                               # optional — default 100 entries
   water_cut_script: script.cut_water                   # optional — called when water is cut
   water_available_script: script.restore_water         # optional — called when water is restored
@@ -65,8 +66,14 @@ running long. The baseline is the reading at session start, and **resets on
 each `RESUMED` event** (humidity rising again during the `cooldown_seconds`
 window) so a sibling starting a fresh shower right after the first gets their
 own baseline instead of inheriting the previous person's cumulative rise.
-There is intentionally no duration-based fallback — if humidity never rises
-enough (and no presence sensor is configured), a session has no cutoff.
+
+**Duration fallback (optional):** `max_session_seconds` (default 900s / 15
+min) is only wired in when **no `presence_sensor` is configured**. With a
+presence sensor, an unattended session is already caught precisely by
+presence absence, and a duration cap would reintroduce the "cold shower"
+stiffness the delta policy was designed to avoid — so it's disabled
+automatically in that case. Without a presence sensor, it's the safety net
+for a session whose humidity never rises enough to trip the delta policy.
 
 **Actuator (v1.0):** either script may be omitted independently. If a script
 for a given decision isn't configured, that side stays dry run (computed and
@@ -79,7 +86,7 @@ active session with no presence detected (`'off'`) cuts water **immediately**
 running shower. Presence changes are evaluated as soon as they're reported,
 without waiting for the next humidity reading. If `presence_sensor` is not
 configured, or its state is `unknown`/`unavailable`, behavior falls back to
-the humidity-delta policy only.
+the humidity-delta policy (plus the duration fallback if configured).
 
 **Decision Logging (v0.4):** every Decision Engine evaluation — not just
 changes — is recorded into a bounded, in-memory `DecisionLog`
@@ -98,7 +105,8 @@ against historical data, entirely outside Home Assistant.
 python -m custom_components.shower_guard.replay readings.csv \
   --humidity-threshold 75.0 \
   --cooldown-seconds 300 \
-  --max-humidity-delta 15.0
+  --max-humidity-delta 15.0 \
+  --max-session-seconds 900
 ```
 
 `readings.csv` must have `timestamp` (ISO 8601) and `humidity` columns. From
