@@ -1,7 +1,8 @@
 # Shower Guard — Backlog
 
-Features deferred beyond the current roadmap. All milestones through v1.0
-(Real Actuator) are complete — remaining work lives here until scheduled.
+Features deferred beyond the current roadmap. All milestones through v1.1
+(Humidity-Delta Cutoff) are complete — remaining work lives here until
+scheduled.
 
 ---
 
@@ -29,6 +30,19 @@ Features deferred beyond the current roadmap. All milestones through v1.0
   scenarios becomes necessary for validation.
 - **Notes:** Would require a parallel presence-readings sequence (or a merged
   reading type) fed into `DecisionEngine.evaluate(..., presence=...)`.
+
+### No-Cutoff Edge Case (Humidity-Delta-Only Policy)
+- **Reason deferred:** v1.1 fully replaced the duration-based cutoff
+  (`max_session_seconds`) with a humidity-delta policy, per explicit request.
+  This means a session with no presence sensor configured and humidity that
+  never rises enough (e.g. an already-humid room, or a sensor that stops
+  reporting) has no cutoff at all — water can remain available indefinitely.
+- **Target version:** Unscheduled — revisit only if this proves to be a real
+  problem in practice.
+- **Notes:** A `presence_sensor` closes this gap today (absence always cuts
+  water immediately). If needed later, an optional hard-cap duration could be
+  reintroduced as a secondary fallback without reversing the humidity-delta
+  policy itself.
 
 ---
 

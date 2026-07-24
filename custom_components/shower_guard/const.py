@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 1.0.0
+# version: 1.1.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # Session Detection
 # Humidity level (% RH) that triggers session start.
@@ -20,10 +20,13 @@ CONF_HUMIDITY_SENSOR = "humidity_sensor"
 CONF_HUMIDITY_THRESHOLD = "humidity_threshold"
 CONF_COOLDOWN_SECONDS = "cooldown_seconds"
 
-# Decision Engine (dry run — no actuator call, see ADR-0001)
-# Maximum time (seconds) a session may run before water is decided unavailable.
-DEFAULT_MAX_SESSION_SECONDS: float = 900.0  # 15 minutes
-CONF_MAX_SESSION_SECONDS = "max_session_seconds"
+# Decision Engine (see ADR-0001)
+# Maximum humidity rise (percentage points RH) above the current baseline
+# (session start; reset on RESUMED so a sibling starting a fresh shower
+# during the cooldown window isn't penalized by the previous person's
+# cumulative rise) before water is decided unavailable.
+DEFAULT_MAX_HUMIDITY_DELTA: float = 15.0
+CONF_MAX_HUMIDITY_DELTA = "max_humidity_delta"
 
 # Decision Logging
 # Number of most recent Decision Engine evaluations to keep in memory.
@@ -32,7 +35,7 @@ CONF_DECISION_LOG_SIZE = "decision_log_size"
 
 # Presence Sensor (optional Sensor Layer input, see ADR-0001)
 # When configured, an active session with no presence detected cuts water
-# immediately, regardless of max_session_seconds.
+# immediately, regardless of humidity delta.
 CONF_PRESENCE_SENSOR = "presence_sensor"
 
 # Actuator (v1.0, see ADR-0001)

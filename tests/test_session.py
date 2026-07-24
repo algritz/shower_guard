@@ -244,6 +244,45 @@ def test_active_since_cleared_on_end():
     assert d.active_since is None
 
 
+# ---------------------------------------------------------------------------
+# active_since_humidity tracking
+# ---------------------------------------------------------------------------
+
+def test_active_since_humidity_none_when_idle():
+    """active_since_humidity is None before any session starts."""
+    d = make_detector()
+    assert d.active_since_humidity is None
+
+
+def test_active_since_humidity_set_on_start():
+    """active_since_humidity is set to the humidity that triggered STARTED."""
+    d = make_detector()
+    d.update(humidity=80.0, now=t(0))
+    assert d.active_since_humidity == 80.0
+
+
+def test_active_since_humidity_resets_on_resume():
+    """active_since_humidity resets to the RESUMED reading (not the original
+    STARTED reading) so a sibling starting a fresh shower during the
+    cooldown window gets its own baseline."""
+    d = make_detector(cooldown=300)
+    d.update(humidity=80.0, now=t(0))          # → ACTIVE, baseline = 80.0
+    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
+    assert d.active_since_humidity == 80.0
+
+    d.update(humidity=76.0, now=t(60))         # → RESUMED (sibling starts)
+    assert d.active_since_humidity == 76.0     # baseline reset to resume reading
+
+
+def test_active_since_humidity_cleared_on_end():
+    """active_since_humidity is cleared once the session ends."""
+    d = make_detector(cooldown=300)
+    d.update(humidity=80.0, now=t(0))          # → ACTIVE
+    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
+    d.update(humidity=60.0, now=t(310))        # → ENDED
+    assert d.active_since_humidity is None
+
+
 if __name__ == "__main__":
     tests = [
         test_idle_low_humidity_no_change,
@@ -262,6 +301,10 @@ if __name__ == "__main__":
         test_active_since_set_on_start,
         test_active_since_persists_through_cooldown_and_resume,
         test_active_since_cleared_on_end,
+        test_active_since_humidity_none_when_idle,
+        test_active_since_humidity_set_on_start,
+        test_active_since_humidity_resets_on_resume,
+        test_active_since_humidity_cleared_on_end,
     ]
     passed = 0
     failed = 0

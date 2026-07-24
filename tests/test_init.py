@@ -1,8 +1,9 @@
 # ---
 # purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
 #          -> DecisionLog wiring (v0.2/v0.3/v0.4), the optional presence
-#          sensor wiring (v0.6), and the actuator script wiring (v1.0).
-# version: 1.0.0
+#          sensor wiring (v0.6), the actuator script wiring (v1.0), and the
+#          humidity-delta cutoff policy (v1.1).
+# version: 1.1.0
 # ---
 
 import asyncio
@@ -137,7 +138,7 @@ def test_async_setup_uses_custom_decision_log_size():
     assert decision_log.max_entries == 5
 
 
-def test_async_setup_uses_custom_max_session_seconds():
+def test_async_setup_uses_custom_max_humidity_delta():
     hass = make_hass()
     patch_track_state_change()
 
@@ -147,14 +148,14 @@ def test_async_setup_uses_custom_max_session_seconds():
             {
                 DOMAIN: {
                     "humidity_sensor": "sensor.bathroom_humidity",
-                    "max_session_seconds": 60,
+                    "max_humidity_delta": 5.0,
                 }
             },
         )
     )
 
     engine = hass.data[DOMAIN]["decision_engine"]
-    assert engine.max_session_seconds == 60
+    assert engine.max_humidity_delta == 5.0
 
 
 def test_async_setup_uses_custom_threshold_and_cooldown():
@@ -275,7 +276,7 @@ def test_humidity_callback_records_water_available_decision():
     assert last_decision.decision is Decision.WATER_AVAILABLE
 
 
-def test_humidity_callback_records_water_cut_when_session_exceeds_limit():
+def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold():
     hass = make_hass()
     captured = patch_track_state_change()
 
@@ -285,7 +286,7 @@ def test_humidity_callback_records_water_cut_when_session_exceeds_limit():
             {
                 DOMAIN: {
                     "humidity_sensor": "sensor.bathroom_humidity",
-                    "max_session_seconds": 0,
+                    "max_humidity_delta": 0,
                 }
             },
         )
@@ -365,13 +366,13 @@ def test_presence_absent_cuts_water_immediately_during_active_session():
     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
     presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
 
-    # Shower starts — no presence info yet, so duration-based policy applies.
+    # Shower starts — no presence info yet, so the humidity-delta policy applies.
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
     asyncio.run(humidity_callback(event))
     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
 
     # Presence sensor reports the room is now empty — immediate cut, even
-    # though max_session_seconds has not elapsed and no new humidity arrived.
+    # though the humidity delta is still small and no new humidity arrived.
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
     asyncio.run(presence_callback(event))
 
@@ -479,7 +480,7 @@ def test_actuator_called_on_water_cut_decision():
             {
                 DOMAIN: {
                     "humidity_sensor": "sensor.bathroom_humidity",
-                    "max_session_seconds": 0,
+                    "max_humidity_delta": 0,
                     "water_cut_script": "script.cut_water",
                 }
             },
@@ -563,20 +564,125 @@ def test_actuator_only_calls_configured_side():
     ]
 
 
+# ---------------------------------------------------------------------------
+# Humidity delta wiring (v1.1 — the sole cutoff trigger besides presence)
+# ---------------------------------------------------------------------------
+
+def test_humidity_delta_cuts_water_quickly_via_wiring():
+    """A fast humidity rise cuts water immediately through the full wiring,
+    regardless of how little time has elapsed."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_humidity_delta": 5.0,
+                }
+            },
+        )
+    )
+
+    # Session starts at the threshold (baseline = 75.0).
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+    asyncio.run(captured["callback"](event))
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+
+    # Humidity jumps well past the delta threshold almost immediately.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="85.0")})
+    asyncio.run(captured["callback"](event))
+
+    last_decision = hass.data[DOMAIN]["last_decision"]
+    assert last_decision.decision is Decision.WATER_CUT
+    assert last_decision.humidity_delta == 10.0
+
+
+def test_cold_shower_stays_available_indefinitely_below_delta():
+    """A low humidity-delta reading stays available indefinitely — there is
+    no duration-based fallback; addresses the 'cold shower' case."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_humidity_delta": 10.0,
+                }
+            },
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+    asyncio.run(captured["callback"](event))
+
+    # Humidity barely rises — a cold shower generating little steam.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="77.0")})
+    asyncio.run(captured["callback"](event))
+
+    last_decision = hass.data[DOMAIN]["last_decision"]
+    assert last_decision.decision is Decision.WATER_AVAILABLE
+    assert last_decision.humidity_delta == 2.0
+
+
+def test_sibling_shower_gets_fresh_baseline_after_resume():
+    """A sibling starting a shower during the cooldown window resets the
+    humidity baseline, rather than inheriting the first sibling's rise."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_humidity_delta": 15.0,
+                    "cooldown_seconds": 300,
+                }
+            },
+        )
+    )
+
+    # Kid A showers: humidity rises close to (but under) the cut threshold.
+    for state in ("75.0", "88.0"):
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+        asyncio.run(captured["callback"](event))
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+
+    # Kid A steps out — humidity drops, entering COOLDOWN.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="60.0")})
+    asyncio.run(captured["callback"](event))
+    assert hass.data[DOMAIN]["detector"].state is SessionState.COOLDOWN
+
+    # Kid B starts within the cooldown window — RESUMED, fresh baseline.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="76.0")})
+    asyncio.run(captured["callback"](event))
+    assert hass.data[DOMAIN]["detector"].active_since_humidity == 76.0
+    # Delta is measured from the fresh 76.0 baseline, not kid A's original 75.0.
+    assert hass.data[DOMAIN]["last_decision"].humidity_delta == 0.0
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+
+
 if __name__ == "__main__":
     tests = [
         test_async_setup_without_config_is_noop,
         test_async_setup_without_humidity_sensor_is_noop,
         test_async_setup_registers_state_listener,
         test_async_setup_uses_custom_decision_log_size,
-        test_async_setup_uses_custom_max_session_seconds,
+        test_async_setup_uses_custom_max_humidity_delta,
         test_async_setup_uses_custom_threshold_and_cooldown,
         test_humidity_callback_feeds_detector,
         test_humidity_callback_ignores_unavailable_state,
         test_humidity_callback_ignores_non_numeric_state,
         test_humidity_callback_ignores_missing_new_state,
         test_humidity_callback_records_water_available_decision,
-        test_humidity_callback_records_water_cut_when_session_exceeds_limit,
+        test_humidity_callback_records_water_cut_when_delta_exceeds_threshold,
         test_humidity_callback_records_every_evaluation_in_decision_log,
         test_async_setup_registers_presence_listener_when_configured,
         test_presence_absent_cuts_water_immediately_during_active_session,
@@ -587,6 +693,9 @@ if __name__ == "__main__":
         test_actuator_called_on_water_cut_decision,
         test_actuator_not_called_again_when_decision_unchanged,
         test_actuator_only_calls_configured_side,
+        test_humidity_delta_cuts_water_quickly_via_wiring,
+        test_cold_shower_stays_available_indefinitely_below_delta,
+        test_sibling_shower_gets_fresh_baseline_after_resume,
     ]
     passed = 0
     failed = 0

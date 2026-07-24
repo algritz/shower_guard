@@ -27,6 +27,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 | v0.5    | Replay Support      | ✅ Done     |
 | v0.6    | Presence Sensor     | ✅ Done     |
 | v1.0    | Real Actuator       | ✅ Done     |
+| v1.1    | Humidity-Delta Cutoff | ✅ Done   |
 
 ## Installation
 
@@ -34,7 +35,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 2. Restart Home Assistant.
 3. Configure via `configuration.yaml` (see below).
 
-## Configuration (v1.0)
+## Configuration (v1.1)
 
 ```yaml
 shower_guard:
@@ -42,7 +43,7 @@ shower_guard:
   presence_sensor: binary_sensor.bathroom_presence    # optional — 'on'/'off' presence entity
   humidity_threshold: 75.0                            # optional — default 75.0
   cooldown_seconds: 300                               # optional — default 300 (5 min)
-  max_session_seconds: 900                             # optional — default 900 (15 min)
+  max_humidity_delta: 15.0                             # optional — default 15.0 (percentage points RH)
   decision_log_size: 100                               # optional — default 100 entries
   water_cut_script: script.cut_water                   # optional — called when water is cut
   water_available_script: script.restore_water         # optional — called when water is restored
@@ -56,6 +57,17 @@ Home Assistant log. On every decision **change**, the corresponding HA script
 `script.turn_on` service, per ADR-0001 (actuator abstraction via scripts only;
 the Decision Engine itself never references a script or device).
 
+**Humidity-delta cutoff (v1.1):** water is cut once humidity has risen
+`max_humidity_delta` percentage points above the current baseline — not
+after a fixed duration. A hot shower generates steam quickly and gets capped
+sooner; a cold shower (little humidity rise) is not penalized just for
+running long. The baseline is the reading at session start, and **resets on
+each `RESUMED` event** (humidity rising again during the `cooldown_seconds`
+window) so a sibling starting a fresh shower right after the first gets their
+own baseline instead of inheriting the previous person's cumulative rise.
+There is intentionally no duration-based fallback — if humidity never rises
+enough (and no presence sensor is configured), a session has no cutoff.
+
 **Actuator (v1.0):** either script may be omitted independently. If a script
 for a given decision isn't configured, that side stays dry run (computed and
 logged only) while the other side can still actuate. A failed script call is
@@ -63,11 +75,11 @@ caught and logged — it never crashes session tracking.
 
 **Presence Sensor (v0.6, optional):** when `presence_sensor` is configured, an
 active session with no presence detected (`'off'`) cuts water **immediately**
-— independent of `max_session_seconds` — modeling an unattended running
-shower. Presence changes are evaluated as soon as they're reported, without
-waiting for the next humidity reading. If `presence_sensor` is not configured,
-or its state is `unknown`/`unavailable`, behavior is unchanged (duration-based
-policy only).
+— taking priority over the humidity-delta policy — modeling an unattended
+running shower. Presence changes are evaluated as soon as they're reported,
+without waiting for the next humidity reading. If `presence_sensor` is not
+configured, or its state is `unknown`/`unavailable`, behavior falls back to
+the humidity-delta policy only.
 
 **Decision Logging (v0.4):** every Decision Engine evaluation — not just
 changes — is recorded into a bounded, in-memory `DecisionLog`
@@ -79,14 +91,14 @@ build on.
 
 Replay recorded or synthetic humidity readings through the **exact same**
 `SessionDetector` and `DecisionEngine` classes used in production — no
-decision logic is duplicated. Useful for validating threshold/cooldown tuning
+decision logic is duplicated. Useful for validating threshold/delta tuning
 against historical data, entirely outside Home Assistant.
 
 ```bash
 python -m custom_components.shower_guard.replay readings.csv \
   --humidity-threshold 75.0 \
   --cooldown-seconds 300 \
-  --max-session-seconds 900
+  --max-humidity-delta 15.0
 ```
 
 `readings.csv` must have `timestamp` (ISO 8601) and `humidity` columns. From

@@ -2,7 +2,7 @@
 # purpose: Replay Engine — replays historical or synthetic humidity readings
 #          through the exact same Session Detection and Decision Engine
 #          classes used in production. No decision logic is duplicated here.
-# version: 0.5.0
+# version: 1.1.0
 # note:    Pure Python. No Home Assistant imports. Keep lightweight per
 #          ADR-0001. Runnable standalone:
 #          `python -m custom_components.shower_guard.replay <csv-file>`.
@@ -20,7 +20,7 @@ from .const import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DECISION_LOG_SIZE,
     DEFAULT_HUMIDITY_THRESHOLD,
-    DEFAULT_MAX_SESSION_SECONDS,
+    DEFAULT_MAX_HUMIDITY_DELTA,
 )
 from .decision import DecisionEngine, DecisionLog
 from .session import SessionDetector, StateChange
@@ -40,7 +40,7 @@ def replay(
     *,
     humidity_threshold: float = DEFAULT_HUMIDITY_THRESHOLD,
     cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
-    max_session_seconds: float = DEFAULT_MAX_SESSION_SECONDS,
+    max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
     decision_log_size: int = DEFAULT_DECISION_LOG_SIZE,
 ) -> ReplayResult:
     """
@@ -52,7 +52,7 @@ def replay(
     detector = SessionDetector(
         humidity_threshold=humidity_threshold, cooldown_seconds=cooldown_seconds
     )
-    engine = DecisionEngine(max_session_seconds=max_session_seconds)
+    engine = DecisionEngine(max_humidity_delta=max_humidity_delta)
     result = ReplayResult(decision_log=DecisionLog(max_entries=decision_log_size))
 
     for now, humidity in readings:
@@ -60,7 +60,13 @@ def replay(
         if change is not None:
             result.state_changes.append(change)
 
-        decision = engine.evaluate(detector.state, detector.active_since, now)
+        decision = engine.evaluate(
+            detector.state,
+            detector.active_since,
+            now,
+            humidity=humidity,
+            active_since_humidity=detector.active_since_humidity,
+        )
         result.decision_log.record(decision)
 
     return result
@@ -97,7 +103,7 @@ def _main() -> None:
         "--cooldown-seconds", type=int, default=DEFAULT_COOLDOWN_SECONDS
     )
     parser.add_argument(
-        "--max-session-seconds", type=float, default=DEFAULT_MAX_SESSION_SECONDS
+        "--max-humidity-delta", type=float, default=DEFAULT_MAX_HUMIDITY_DELTA
     )
     args = parser.parse_args()
 
@@ -106,7 +112,7 @@ def _main() -> None:
         readings,
         humidity_threshold=args.humidity_threshold,
         cooldown_seconds=args.cooldown_seconds,
-        max_session_seconds=args.max_session_seconds,
+        max_humidity_delta=args.max_humidity_delta,
     )
 
     print(f"Replayed {len(readings)} readings.\n")

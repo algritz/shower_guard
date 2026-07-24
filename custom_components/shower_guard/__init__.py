@@ -1,6 +1,6 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 1.0.0
+# version: 1.1.0
 # note: Wires the Sensor Layer (humidity entity, optional presence entity)
 #       into Session Detection and the Decision Engine, records every
 #       decision into a bounded DecisionLog, and — when configured — calls
@@ -22,14 +22,14 @@ from .const import (
     CONF_DECISION_LOG_SIZE,
     CONF_HUMIDITY_SENSOR,
     CONF_HUMIDITY_THRESHOLD,
-    CONF_MAX_SESSION_SECONDS,
+    CONF_MAX_HUMIDITY_DELTA,
     CONF_PRESENCE_SENSOR,
     CONF_WATER_AVAILABLE_SCRIPT,
     CONF_WATER_CUT_SCRIPT,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DECISION_LOG_SIZE,
     DEFAULT_HUMIDITY_THRESHOLD,
-    DEFAULT_MAX_SESSION_SECONDS,
+    DEFAULT_MAX_HUMIDITY_DELTA,
     DOMAIN,
     VERSION,
 )
@@ -75,8 +75,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         ),
     )
     engine = DecisionEngine(
-        max_session_seconds=domain_config.get(
-            CONF_MAX_SESSION_SECONDS, DEFAULT_MAX_SESSION_SECONDS
+        max_humidity_delta=domain_config.get(
+            CONF_MAX_HUMIDITY_DELTA, DEFAULT_MAX_HUMIDITY_DELTA
         ),
     )
     decision_log = DecisionLog(
@@ -89,6 +89,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data[DOMAIN]["decision_log"] = decision_log
     hass.data[DOMAIN]["last_decision"] = None
     hass.data[DOMAIN]["presence"] = None  # None = no presence sensor / unknown
+    hass.data[DOMAIN]["last_humidity"] = None  # None = no humidity reading yet
 
     water_cut_script = domain_config.get(CONF_WATER_CUT_SCRIPT)
     water_available_script = domain_config.get(CONF_WATER_AVAILABLE_SCRIPT)
@@ -132,6 +133,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             detector.state,
             detector.active_since,
             now,
+            humidity=hass.data[DOMAIN]["last_humidity"],
+            active_since_humidity=detector.active_since_humidity,
             presence=hass.data[DOMAIN]["presence"],
         )
         decision_log.record(result)
@@ -160,6 +163,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             return
 
         now = datetime.now()
+        hass.data[DOMAIN]["last_humidity"] = humidity
 
         change = detector.update(humidity=humidity, now=now)
         if change is not None:

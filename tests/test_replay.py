@@ -1,6 +1,6 @@
 # ---
-# purpose: Tests for the Replay Engine (v0.5).
-# version: 0.5.0
+# purpose: Tests for the Replay Engine (v0.5, v1.1 humidity delta).
+# version: 1.1.0
 # ---
 
 import sys
@@ -66,9 +66,9 @@ def test_replay_records_a_decision_per_reading():
     assert len(result.decision_log) == 3
 
 
-def test_replay_water_cut_when_session_exceeds_limit():
-    readings = [(t(0), 80.0), (t(1000), 85.0)]
-    result = replay(readings, max_session_seconds=900)
+def test_replay_water_cut_when_humidity_delta_exceeds_threshold():
+    readings = [(t(0), 75.0), (t(60), 92.0)]
+    result = replay(readings, max_humidity_delta=15.0)
 
     assert result.decision_log.last.decision is Decision.WATER_CUT
 
@@ -131,7 +131,7 @@ if __name__ == "__main__":
         test_replay_empty_readings_produces_empty_result,
         test_replay_full_session_lifecycle,
         test_replay_records_a_decision_per_reading,
-        test_replay_water_cut_when_session_exceeds_limit,
+        test_replay_water_cut_when_humidity_delta_exceeds_threshold,
         test_replay_respects_custom_threshold_and_cooldown,
         test_replay_decision_log_respects_size_limit,
         test_load_readings_from_csv,
