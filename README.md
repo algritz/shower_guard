@@ -25,8 +25,8 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 | v0.2    | Session Detection   | ✅ Done     |
 | v0.3    | Dry Run             | ✅ Done     |
 | v0.4    | Decision Logging    | ✅ Done     |
-| v0.5    | Replay Support      | 🔜 Next     |
-| v0.6    | Presence Sensor     | Planned     |
+| v0.5    | Replay Support      | ✅ Done     |
+| v0.6    | Presence Sensor     | 🔜 Next     |
 | v1.0    | Real Actuator       | Planned     |
 
 ## Installation
@@ -60,6 +60,33 @@ build on.
 **Dry run:** the Decision Engine only computes and logs decisions — it never
 calls an actuator or HA script. Real actuator wiring arrives in v1.0 per
 ADR-0001.
+
+## Replay Engine (v0.5)
+
+Replay recorded or synthetic humidity readings through the **exact same**
+`SessionDetector` and `DecisionEngine` classes used in production — no
+decision logic is duplicated. Useful for validating threshold/cooldown tuning
+against historical data, entirely outside Home Assistant.
+
+```bash
+python -m custom_components.shower_guard.replay readings.csv \
+  --humidity-threshold 75.0 \
+  --cooldown-seconds 300 \
+  --max-session-seconds 900
+```
+
+`readings.csv` must have `timestamp` (ISO 8601) and `humidity` columns. From
+Python:
+
+```python
+from custom_components.shower_guard.replay import replay, load_readings_from_csv
+
+readings = load_readings_from_csv("readings.csv")
+result = replay(readings)
+
+result.state_changes   # list[StateChange]
+result.decision_log     # DecisionLog — same object used by the live integration
+```
 
 ## Architecture Decision Records
 

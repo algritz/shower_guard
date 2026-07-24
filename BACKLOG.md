@@ -1,7 +1,7 @@
 # Shower Guard — Backlog
 
 Features deferred beyond the next two active milestones.
-Current active milestones: **v0.4 (Decision Logging)** and **v0.5 (Replay Support)**.
+Current active milestones: **v0.5 (Replay Support)** and **v0.6 (Presence Sensor)**.
 
 ---
 
