@@ -1,9 +1,10 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 0.3.0
+# version: 0.4.0
 # note: Wires the Sensor Layer (humidity entity) into Session Detection and
-#       the Decision Engine. v0.3 is dry run — decisions are logged only; no
-#       actuator or HA script is invoked yet (see ADR-0001, roadmap v1.0).
+#       the Decision Engine, and records every decision into a bounded
+#       DecisionLog (v0.4). Still dry run — no actuator or HA script is
+#       invoked yet (see ADR-0001, roadmap v1.0).
 # ---
 
 import logging
@@ -15,16 +16,18 @@ from homeassistant.helpers.event import async_track_state_change_event
 
 from .const import (
     CONF_COOLDOWN_SECONDS,
+    CONF_DECISION_LOG_SIZE,
     CONF_HUMIDITY_SENSOR,
     CONF_HUMIDITY_THRESHOLD,
     CONF_MAX_SESSION_SECONDS,
     DEFAULT_COOLDOWN_SECONDS,
+    DEFAULT_DECISION_LOG_SIZE,
     DEFAULT_HUMIDITY_THRESHOLD,
     DEFAULT_MAX_SESSION_SECONDS,
     DOMAIN,
     VERSION,
 )
-from .decision import DecisionEngine
+from .decision import DecisionEngine, DecisionLog
 from .session import SessionDetector
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,13 +69,20 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             CONF_MAX_SESSION_SECONDS, DEFAULT_MAX_SESSION_SECONDS
         ),
     )
+    decision_log = DecisionLog(
+        max_entries=domain_config.get(
+            CONF_DECISION_LOG_SIZE, DEFAULT_DECISION_LOG_SIZE
+        ),
+    )
     hass.data[DOMAIN]["detector"] = detector
     hass.data[DOMAIN]["decision_engine"] = engine
+    hass.data[DOMAIN]["decision_log"] = decision_log
     hass.data[DOMAIN]["last_decision"] = None
 
     async def _handle_humidity_change(event) -> None:
         """Feed a new humidity reading through Session Detection and the
-        Decision Engine (dry run — logged only, no actuator call)."""
+        Decision Engine (dry run — logged only, no actuator call). Every
+        evaluation is recorded into the DecisionLog."""
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _IGNORED_STATES:
             return
@@ -94,6 +104,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             _LOGGER.info("Shower Guard: %s", change)
 
         result = engine.evaluate(detector.state, detector.active_since, now)
+        decision_log.record(result)
         previous = hass.data[DOMAIN]["last_decision"]
         hass.data[DOMAIN]["last_decision"] = result
         if previous is None or result.decision != previous.decision:

@@ -1,6 +1,7 @@
 # ---
-# purpose: Tests for the Decision Engine layer (v0.3, dry run).
-# version: 0.3.0
+# purpose: Tests for the Decision Engine layer (v0.3, dry run) and
+#          DecisionLog (v0.4, decision logging).
+# version: 0.4.0
 # ---
 
 import sys
@@ -19,7 +20,7 @@ for _mod in (
 ):
     sys.modules.setdefault(_mod, MagicMock())
 
-from custom_components.shower_guard.decision import Decision, DecisionEngine
+from custom_components.shower_guard.decision import Decision, DecisionEngine, DecisionLog
 from custom_components.shower_guard.session import SessionState
 
 T0 = datetime(2026, 1, 1, 8, 0, 0)
@@ -78,6 +79,49 @@ def test_decision_result_str_is_readable():
     assert "300" in text
 
 
+# ---------------------------------------------------------------------------
+# DecisionLog (v0.4)
+# ---------------------------------------------------------------------------
+
+def test_decision_log_starts_empty():
+    """A fresh DecisionLog has no entries."""
+    log = DecisionLog(max_entries=10)
+    assert len(log) == 0
+    assert log.entries == ()
+    assert log.last is None
+
+
+def test_decision_log_records_entries_in_order():
+    """Recorded entries are kept oldest-first."""
+    engine = DecisionEngine(max_session_seconds=900)
+    log = DecisionLog(max_entries=10)
+
+    r1 = engine.evaluate(SessionState.IDLE, active_since=None, now=t(0))
+    r2 = engine.evaluate(SessionState.ACTIVE, active_since=t(0), now=t(60))
+    log.record(r1)
+    log.record(r2)
+
+    assert len(log) == 2
+    assert log.entries == (r1, r2)
+    assert log.last is r2
+
+
+def test_decision_log_evicts_oldest_beyond_max_entries():
+    """Once max_entries is exceeded, the oldest entries are dropped."""
+    engine = DecisionEngine(max_session_seconds=900)
+    log = DecisionLog(max_entries=2)
+
+    r1 = engine.evaluate(SessionState.IDLE, active_since=None, now=t(0))
+    r2 = engine.evaluate(SessionState.IDLE, active_since=None, now=t(1))
+    r3 = engine.evaluate(SessionState.IDLE, active_since=None, now=t(2))
+    for r in (r1, r2, r3):
+        log.record(r)
+
+    assert len(log) == 2
+    assert log.entries == (r2, r3)
+    assert log.last is r3
+
+
 if __name__ == "__main__":
     tests = [
         test_idle_state_water_available,
@@ -86,6 +130,9 @@ if __name__ == "__main__":
         test_cooldown_exceeding_limit_water_cut,
         test_custom_max_session_seconds,
         test_decision_result_str_is_readable,
+        test_decision_log_starts_empty,
+        test_decision_log_records_entries_in_order,
+        test_decision_log_evicts_oldest_beyond_max_entries,
     ]
     passed = 0
     failed = 0

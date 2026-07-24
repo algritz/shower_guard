@@ -1,7 +1,7 @@
 # Shower Guard — Backlog
 
 Features deferred beyond the next two active milestones.
-Current active milestones: **v0.2 (Session Detection)** and **v0.3 (Dry Run)**.
+Current active milestones: **v0.4 (Decision Logging)** and **v0.5 (Replay Support)**.
 
 ---
 

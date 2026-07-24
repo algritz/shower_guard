@@ -1,21 +1,23 @@
 # ---
 # purpose: Decision Engine layer — decides whether water should remain
-#          available. Actuator-agnostic per ADR-0001.
-# version: 0.3.0
+#          available. Actuator-agnostic per ADR-0001. Also includes
+#          DecisionLog, a bounded audit trail of evaluations (v0.4).
+# version: 0.4.0
 # note:    Pure Python. No Home Assistant imports. Consumes Session Detection
 #          output only, never raw sensor data. Safe to unit-test and replay.
-#          Dry run only (v0.3): evaluations are computed and returned/logged
-#          by the caller — no actuator or HA script is invoked here.
+#          Dry run only: evaluations are computed and returned/logged by the
+#          caller — no actuator or HA script is invoked here.
 # ---
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from .const import DEFAULT_MAX_SESSION_SECONDS
+from .const import DEFAULT_DECISION_LOG_SIZE, DEFAULT_MAX_SESSION_SECONDS
 from .session import SessionState
 
 
@@ -105,3 +107,35 @@ class DecisionEngine:
             session_state=session_state,
             session_duration_seconds=duration,
         )
+
+
+class DecisionLog:
+    """
+    Bounded, in-memory audit trail of Decision Engine evaluations (v0.4).
+
+    Every ``DecisionEngine.evaluate()`` result can be recorded here, giving a
+    structured history for troubleshooting today and a foundation the Replay
+    Engine (v0.5) can build on. Oldest entries are dropped once ``max_entries``
+    is exceeded. Pure Python — no Home Assistant imports.
+    """
+
+    def __init__(self, max_entries: int = DEFAULT_DECISION_LOG_SIZE) -> None:
+        self.max_entries = max_entries
+        self._entries: deque[DecisionResult] = deque(maxlen=max_entries)
+
+    def record(self, result: DecisionResult) -> None:
+        """Append a decision result to the log."""
+        self._entries.append(result)
+
+    @property
+    def entries(self) -> tuple[DecisionResult, ...]:
+        """All recorded entries, oldest first."""
+        return tuple(self._entries)
+
+    @property
+    def last(self) -> Optional[DecisionResult]:
+        """Most recently recorded entry, or ``None`` if empty."""
+        return self._entries[-1] if self._entries else None
+
+    def __len__(self) -> int:
+        return len(self._entries)
