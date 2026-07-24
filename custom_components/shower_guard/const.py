@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 0.6.0
+# version: 1.0.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "0.6.0"
+VERSION = "1.0.0"
 
 # Session Detection
 # Humidity level (% RH) that triggers session start.
@@ -34,3 +34,11 @@ CONF_DECISION_LOG_SIZE = "decision_log_size"
 # When configured, an active session with no presence detected cuts water
 # immediately, regardless of max_session_seconds.
 CONF_PRESENCE_SENSOR = "presence_sensor"
+
+# Actuator (v1.0, see ADR-0001)
+# HA script entities called on a decision change. The Decision Engine never
+# references these directly — only the Sensor Layer wiring (__init__.py)
+# calls them. Either/both may be omitted, in which case that side of the
+# decision remains dry run (computed and logged only).
+CONF_WATER_CUT_SCRIPT = "water_cut_script"
+CONF_WATER_AVAILABLE_SCRIPT = "water_available_script"

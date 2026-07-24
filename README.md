@@ -12,7 +12,6 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 - **Sensor Layer** — Reads humidity and presence sensors from Home Assistant.
 - **Session Detection** — Determines when a shower session starts and ends.
 - **Decision Engine** — Decides whether water should remain available. Actuator-agnostic.
-  Dry run as of v0.3: decisions are computed and logged only — no actuator/script is called yet.
 - **Actuator** — Abstracted via HA scripts. Two deployment targets:
   - Apartment: smart plug controlling a pump.
   - House: Wi-Fi smart valve controlling the water supply.
@@ -27,7 +26,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 | v0.4    | Decision Logging    | ✅ Done     |
 | v0.5    | Replay Support      | ✅ Done     |
 | v0.6    | Presence Sensor     | ✅ Done     |
-| v1.0    | Real Actuator       | 🔜 Next     |
+| v1.0    | Real Actuator       | ✅ Done     |
 
 ## Installation
 
@@ -35,7 +34,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 2. Restart Home Assistant.
 3. Configure via `configuration.yaml` (see below).
 
-## Configuration (v0.6)
+## Configuration (v1.0)
 
 ```yaml
 shower_guard:
@@ -43,32 +42,38 @@ shower_guard:
   presence_sensor: binary_sensor.bathroom_presence    # optional — 'on'/'off' presence entity
   humidity_threshold: 75.0                            # optional — default 75.0
   cooldown_seconds: 300                               # optional — default 300 (5 min)
-  max_session_seconds: 900                            # optional — default 900 (15 min)
-  decision_log_size: 100                              # optional — default 100 entries
+  max_session_seconds: 900                             # optional — default 900 (15 min)
+  decision_log_size: 100                               # optional — default 100 entries
+  water_cut_script: script.cut_water                   # optional — called when water is cut
+  water_available_script: script.restore_water         # optional — called when water is restored
 ```
 
 The Sensor Layer listens for state changes on `humidity_sensor` and feeds each
 reading into the Session Detection layer, then into the Decision Engine.
-Session state transitions (`started`, `resumed`, `ended`) and decision changes
-(`water_available`, `water_cut`) are written to the Home Assistant log.
+Session state transitions (`started`, `resumed`, `ended`) are written to the
+Home Assistant log. On every decision **change**, the corresponding HA script
+— `water_cut_script` or `water_available_script` — is called via the
+`script.turn_on` service, per ADR-0001 (actuator abstraction via scripts only;
+the Decision Engine itself never references a script or device).
+
+**Actuator (v1.0):** either script may be omitted independently. If a script
+for a given decision isn't configured, that side stays dry run (computed and
+logged only) while the other side can still actuate. A failed script call is
+caught and logged — it never crashes session tracking.
 
 **Presence Sensor (v0.6, optional):** when `presence_sensor` is configured, an
 active session with no presence detected (`'off'`) cuts water **immediately**
 — independent of `max_session_seconds` — modeling an unattended running
 shower. Presence changes are evaluated as soon as they're reported, without
 waiting for the next humidity reading. If `presence_sensor` is not configured,
-or its state is `unknown`/`unavailable`, behavior is unchanged from v0.5
-(duration-based policy only).
+or its state is `unknown`/`unavailable`, behavior is unchanged (duration-based
+policy only).
 
 **Decision Logging (v0.4):** every Decision Engine evaluation — not just
 changes — is recorded into a bounded, in-memory `DecisionLog`
 (`decision_log_size` entries, oldest dropped first). This gives a structured
 audit trail for troubleshooting and a foundation the Replay Engine (v0.5) can
 build on.
-
-**Dry run:** the Decision Engine only computes and logs decisions — it never
-calls an actuator or HA script. Real actuator wiring arrives in v1.0 per
-ADR-0001.
 
 ## Replay Engine (v0.5)
 

@@ -1,7 +1,7 @@
 # Shower Guard — Backlog
 
-Features deferred beyond the next two active milestones.
-Current active milestones: **v0.6 (Presence Sensor)** and **v1.0 (Real Actuator)**.
+Features deferred beyond the current roadmap. All milestones through v1.0
+(Real Actuator) are complete — remaining work lives here until scheduled.
 
 ---
 
