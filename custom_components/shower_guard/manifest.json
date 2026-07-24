@@ -1,0 +1,11 @@
+{
+  "domain": "shower_guard",
+  "name": "Shower Guard",
+  "version": "0.1.0",
+  "documentation": "https://github.com/algritz/shower_guard",
+  "issue_tracker": "https://github.com/algritz/shower_guard/issues",
+  "dependencies": [],
+  "codeowners": [],
+  "requirements": [],
+  "iot_class": "local_push"
+}
