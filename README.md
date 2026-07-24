@@ -21,8 +21,8 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 | Version | Feature             | Status      |
 |---------|---------------------|-------------|
 | v0.1    | Project Scaffold    | ✅ Done     |
-| v0.2    | Session Detection   | 🔜 Next     |
-| v0.3    | Dry Run             | Planned     |
+| v0.2    | Session Detection   | ✅ Done     |
+| v0.3    | Dry Run             | 🔜 Next     |
 | v0.4    | Decision Logging    | Planned     |
 | v0.5    | Replay Support      | Planned     |
 | v0.6    | Presence Sensor     | Planned     |
@@ -32,7 +32,21 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 
 1. Copy `custom_components/shower_guard/` into your Home Assistant `config/custom_components/` directory.
 2. Restart Home Assistant.
-3. Configure via `configuration.yaml` (see v0.2+ docs).
+3. Configure via `configuration.yaml` (see below).
+
+## Configuration (v0.2)
+
+```yaml
+shower_guard:
+  humidity_sensor: sensor.bathroom_humidity   # required — entity providing % RH
+  humidity_threshold: 75.0                    # optional — default 75.0
+  cooldown_seconds: 300                       # optional — default 300 (5 min)
+```
+
+The Sensor Layer listens for state changes on `humidity_sensor` and feeds each
+reading into the Session Detection layer. State transitions (`started`,
+`resumed`, `ended`) are written to the Home Assistant log. Decision Engine and
+Actuator wiring are not implemented yet — see the roadmap.
 
 ## Architecture Decision Records
 

@@ -7,7 +7,19 @@ Current active milestones: **v0.2 (Session Detection)** and **v0.3 (Dry Run)**.
 
 ## Deferred Items
 
-_Nothing deferred yet. Items will be added here as implementation progresses._
+### YAML Config Schema Validation
+- **Reason deferred:** v0.2 wiring uses lightweight manual dict parsing to avoid
+  adding a schema-validation dependency before the config surface grows.
+- **Target version:** Revisit once Decision Engine config (v0.4) expands options.
+- **Notes:** Home Assistant ships `voluptuous`; no new dependency required when
+  this is picked up.
+
+### UI Config Flow
+- **Reason deferred:** Not required for the current roadmap; YAML config is
+  sufficient for v0.2/v0.3.
+- **Target version:** Unscheduled — only if UI configuration becomes a goal.
+- **Notes:** `async_setup_entry`/`async_unload_entry` are already scaffolded in
+  `__init__.py` for this future use.
 
 ---
 
