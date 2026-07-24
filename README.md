@@ -12,6 +12,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 - **Sensor Layer** — Reads humidity and presence sensors from Home Assistant.
 - **Session Detection** — Determines when a shower session starts and ends.
 - **Decision Engine** — Decides whether water should remain available. Actuator-agnostic.
+  Dry run as of v0.3: decisions are computed and logged only — no actuator/script is called yet.
 - **Actuator** — Abstracted via HA scripts. Two deployment targets:
   - Apartment: smart plug controlling a pump.
   - House: Wi-Fi smart valve controlling the water supply.
@@ -22,8 +23,8 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 |---------|---------------------|-------------|
 | v0.1    | Project Scaffold    | ✅ Done     |
 | v0.2    | Session Detection   | ✅ Done     |
-| v0.3    | Dry Run             | 🔜 Next     |
-| v0.4    | Decision Logging    | Planned     |
+| v0.3    | Dry Run             | ✅ Done     |
+| v0.4    | Decision Logging    | 🔜 Next     |
 | v0.5    | Replay Support      | Planned     |
 | v0.6    | Presence Sensor     | Planned     |
 | v1.0    | Real Actuator       | Planned     |
@@ -34,19 +35,24 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 2. Restart Home Assistant.
 3. Configure via `configuration.yaml` (see below).
 
-## Configuration (v0.2)
+## Configuration (v0.3)
 
 ```yaml
 shower_guard:
   humidity_sensor: sensor.bathroom_humidity   # required — entity providing % RH
   humidity_threshold: 75.0                    # optional — default 75.0
   cooldown_seconds: 300                       # optional — default 300 (5 min)
+  max_session_seconds: 900                    # optional — default 900 (15 min)
 ```
 
 The Sensor Layer listens for state changes on `humidity_sensor` and feeds each
-reading into the Session Detection layer. State transitions (`started`,
-`resumed`, `ended`) are written to the Home Assistant log. Decision Engine and
-Actuator wiring are not implemented yet — see the roadmap.
+reading into the Session Detection layer, then into the Decision Engine.
+Session state transitions (`started`, `resumed`, `ended`) and decision changes
+(`water_available`, `water_cut`) are written to the Home Assistant log.
+
+**Dry run (v0.3):** the Decision Engine only computes and logs decisions — it
+never calls an actuator or HA script. Real actuator wiring arrives in v1.0 per
+ADR-0001.
 
 ## Architecture Decision Records
 

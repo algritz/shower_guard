@@ -1,7 +1,7 @@
 # ---
 # purpose: Session Detection layer — determines when a shower session starts,
 #          continues, resumes, or ends based on humidity readings.
-# version: 0.2.0
+# version: 0.3.0
 # note:    Pure Python. No Home Assistant imports. Safe to unit-test and replay.
 # ---
 
@@ -75,6 +75,7 @@ class SessionDetector:
 
         self._state: SessionState = SessionState.IDLE
         self._cooldown_start: Optional[datetime] = None
+        self._active_since: Optional[datetime] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -84,6 +85,15 @@ class SessionDetector:
     def state(self) -> SessionState:
         """Current session state."""
         return self._state
+
+    @property
+    def active_since(self) -> Optional[datetime]:
+        """
+        Timestamp the current session began (set on STARTED, preserved through
+        COOLDOWN/RESUMED), or ``None`` if IDLE. Used by the Decision Engine to
+        compute session duration without duplicating Session Detection state.
+        """
+        return self._active_since
 
     def update(self, humidity: float, now: datetime) -> Optional[StateChange]:
         """
@@ -118,6 +128,7 @@ class SessionDetector:
         self, above: bool, humidity: float, now: datetime
     ) -> Optional[StateChange]:
         if above:
+            self._active_since = now
             return self._transition(SessionEvent.STARTED, SessionState.ACTIVE, humidity, now)
         return None
 
@@ -144,6 +155,7 @@ class SessionDetector:
         elapsed = (now - self._cooldown_start).total_seconds()
         if elapsed >= self.cooldown_seconds:
             self._cooldown_start = None
+            self._active_since = None
             return self._transition(SessionEvent.ENDED, SessionState.IDLE, humidity, now)
 
         return None
