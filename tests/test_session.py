@@ -207,6 +207,43 @@ def test_full_session_lifecycle():
     assert d.state is SessionState.IDLE
 
 
+# ---------------------------------------------------------------------------
+# active_since tracking
+# ---------------------------------------------------------------------------
+
+def test_active_since_none_when_idle():
+    """active_since is None before any session starts."""
+    d = make_detector()
+    assert d.active_since is None
+
+
+def test_active_since_set_on_start():
+    """active_since is set to the STARTED timestamp."""
+    d = make_detector()
+    d.update(humidity=80.0, now=t(0))
+    assert d.active_since == t(0)
+
+
+def test_active_since_persists_through_cooldown_and_resume():
+    """active_since is preserved across COOLDOWN and RESUMED (same session)."""
+    d = make_detector(cooldown=300)
+    d.update(humidity=80.0, now=t(0))          # → ACTIVE, active_since = t(0)
+    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
+    assert d.active_since == t(0)
+
+    d.update(humidity=80.0, now=t(60))         # → RESUMED
+    assert d.active_since == t(0)
+
+
+def test_active_since_cleared_on_end():
+    """active_since is cleared once the session ends."""
+    d = make_detector(cooldown=300)
+    d.update(humidity=80.0, now=t(0))          # → ACTIVE
+    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
+    d.update(humidity=60.0, now=t(310))        # → ENDED
+    assert d.active_since is None
+
+
 if __name__ == "__main__":
     tests = [
         test_idle_low_humidity_no_change,
@@ -221,6 +258,10 @@ if __name__ == "__main__":
         test_custom_threshold,
         test_custom_cooldown,
         test_full_session_lifecycle,
+        test_active_since_none_when_idle,
+        test_active_since_set_on_start,
+        test_active_since_persists_through_cooldown_and_resume,
+        test_active_since_cleared_on_end,
     ]
     passed = 0
     failed = 0

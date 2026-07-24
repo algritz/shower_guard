@@ -1,6 +1,7 @@
 # ---
-# purpose: Tests for the Sensor Layer -> Session Detection wiring (v0.2).
-# version: 0.2.0
+# purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
+#          wiring (v0.2/v0.3, dry run).
+# version: 0.3.0
 # ---
 
 import asyncio
@@ -22,6 +23,7 @@ for _mod in (
 
 import custom_components.shower_guard as shower_guard
 from custom_components.shower_guard.const import DOMAIN
+from custom_components.shower_guard.decision import Decision
 from custom_components.shower_guard.session import SessionState
 
 
@@ -78,6 +80,28 @@ def test_async_setup_registers_state_listener():
     assert result is True
     assert captured["entity_ids"] == ["sensor.bathroom_humidity"]
     assert hass.data[DOMAIN]["detector"].state is SessionState.IDLE
+    assert hass.data[DOMAIN]["decision_engine"] is not None
+    assert hass.data[DOMAIN]["last_decision"] is None
+
+
+def test_async_setup_uses_custom_max_session_seconds():
+    hass = make_hass()
+    patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_session_seconds": 60,
+                }
+            },
+        )
+    )
+
+    engine = hass.data[DOMAIN]["decision_engine"]
+    assert engine.max_session_seconds == 60
 
 
 def test_async_setup_uses_custom_threshold_and_cooldown():
@@ -176,16 +200,64 @@ def test_humidity_callback_ignores_missing_new_state():
     assert detector.state is SessionState.IDLE
 
 
+# ---------------------------------------------------------------------------
+# Decision Engine wiring (v0.3, dry run — logged only, no actuator call)
+# ---------------------------------------------------------------------------
+
+def test_humidity_callback_records_water_available_decision():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    asyncio.run(captured["callback"](event))
+
+    last_decision = hass.data[DOMAIN]["last_decision"]
+    assert last_decision is not None
+    assert last_decision.decision is Decision.WATER_AVAILABLE
+
+
+def test_humidity_callback_records_water_cut_when_session_exceeds_limit():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_session_seconds": 0,
+                }
+            },
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    asyncio.run(captured["callback"](event))
+
+    last_decision = hass.data[DOMAIN]["last_decision"]
+    assert last_decision.decision is Decision.WATER_CUT
+
+
 if __name__ == "__main__":
     tests = [
         test_async_setup_without_config_is_noop,
         test_async_setup_without_humidity_sensor_is_noop,
         test_async_setup_registers_state_listener,
+        test_async_setup_uses_custom_max_session_seconds,
         test_async_setup_uses_custom_threshold_and_cooldown,
         test_humidity_callback_feeds_detector,
         test_humidity_callback_ignores_unavailable_state,
         test_humidity_callback_ignores_non_numeric_state,
         test_humidity_callback_ignores_missing_new_state,
+        test_humidity_callback_records_water_available_decision,
+        test_humidity_callback_records_water_cut_when_session_exceeds_limit,
     ]
     passed = 0
     failed = 0

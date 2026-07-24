@@ -1,8 +1,9 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 0.2.0
-# note: Wires the Sensor Layer (humidity entity) into the Session Detection
-#       layer. Decision Engine and Actuator are out of scope until v0.3/v1.0.
+# version: 0.3.0
+# note: Wires the Sensor Layer (humidity entity) into Session Detection and
+#       the Decision Engine. v0.3 is dry run — decisions are logged only; no
+#       actuator or HA script is invoked yet (see ADR-0001, roadmap v1.0).
 # ---
 
 import logging
@@ -16,11 +17,14 @@ from .const import (
     CONF_COOLDOWN_SECONDS,
     CONF_HUMIDITY_SENSOR,
     CONF_HUMIDITY_THRESHOLD,
+    CONF_MAX_SESSION_SECONDS,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_HUMIDITY_THRESHOLD,
+    DEFAULT_MAX_SESSION_SECONDS,
     DOMAIN,
     VERSION,
 )
+from .decision import DecisionEngine
 from .session import SessionDetector
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,10 +61,18 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             CONF_COOLDOWN_SECONDS, DEFAULT_COOLDOWN_SECONDS
         ),
     )
+    engine = DecisionEngine(
+        max_session_seconds=domain_config.get(
+            CONF_MAX_SESSION_SECONDS, DEFAULT_MAX_SESSION_SECONDS
+        ),
+    )
     hass.data[DOMAIN]["detector"] = detector
+    hass.data[DOMAIN]["decision_engine"] = engine
+    hass.data[DOMAIN]["last_decision"] = None
 
     async def _handle_humidity_change(event) -> None:
-        """Feed a new humidity reading from the Sensor Layer into detection."""
+        """Feed a new humidity reading through Session Detection and the
+        Decision Engine (dry run — logged only, no actuator call)."""
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state in _IGNORED_STATES:
             return
@@ -75,9 +87,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             )
             return
 
-        change = detector.update(humidity=humidity, now=datetime.now())
+        now = datetime.now()
+
+        change = detector.update(humidity=humidity, now=now)
         if change is not None:
             _LOGGER.info("Shower Guard: %s", change)
+
+        result = engine.evaluate(detector.state, detector.active_since, now)
+        previous = hass.data[DOMAIN]["last_decision"]
+        hass.data[DOMAIN]["last_decision"] = result
+        if previous is None or result.decision != previous.decision:
+            _LOGGER.info("Shower Guard decision (dry run): %s", result)
 
     hass.data[DOMAIN]["remove_listener"] = async_track_state_change_event(
         hass, [humidity_sensor], _handle_humidity_change
