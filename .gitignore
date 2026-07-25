@@ -37,3 +37,4 @@ home-assistant.log
 Thumbs.db
 
 Shower_Guard_Project_Prompt.pdf
+tools/deploy.sh
