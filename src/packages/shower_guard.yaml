@@ -37,13 +37,7 @@ template:
         unique_id: shower_guard_session_state
         icon: mdi:shower
         state: >
-          {% set h = states('sensor.third_reality_inc_3rths0224z_humidity') | float(0) %}
-          {% set threshold = 75.0 %}
-          {% if h >= threshold %}
-            active
-          {% else %}
-            idle
-          {% endif %}
+          {{ states('binary_sensor.shower_guard_session_active') }}
 
       - name: Shower Guard Humidity
         unique_id: shower_guard_humidity
@@ -113,11 +107,10 @@ script:
       - action: input_boolean.turn_on
         target:
           entity_id: input_boolean.shower_guard_pump_should_be_off
-      - action: persistent_notification.create
+      - action: notify.mobile_app_your_phone
         data:
           title: "Shower Guard"
           message: "Water cut — shower session exceeded limits."
-          notification_id: shower_guard_decision
 
   shower_guard_restore_water:
     alias: Shower Guard — Restore Water
