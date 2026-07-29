@@ -107,10 +107,8 @@ script:
       - action: input_boolean.turn_on
         target:
           entity_id: input_boolean.shower_guard_pump_should_be_off
-      - action: notify.mobile_app_your_phone
-        data:
-          title: "Shower Guard"
-          message: "Water cut — shower session exceeded limits."
+      # Notifications are sent by the Shower Guard integration via notify_service,
+      # not by the actuator script itself.
 
   shower_guard_restore_water:
     alias: Shower Guard — Restore Water
@@ -119,6 +117,4 @@ script:
       - action: input_boolean.turn_off
         target:
           entity_id: input_boolean.shower_guard_pump_should_be_off
-      - action: persistent_notification.dismiss
-        data:
-          notification_id: shower_guard_decision
+      # No persistent_notification is created by the current integration.
