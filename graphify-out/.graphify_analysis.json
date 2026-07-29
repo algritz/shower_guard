@@ -1,0 +1,420 @@
+{
+  "communities": {
+    "0": [
+      "tests_test_init",
+      "tests_test_init_callback_for",
+      "tests_test_init_make_hass",
+      "tests_test_init_patch_track_state_change",
+      "tests_test_init_rationale_185",
+      "tests_test_init_rationale_55",
+      "tests_test_init_rationale_646",
+      "tests_test_init_rationale_690",
+      "tests_test_init_rationale_72",
+      "tests_test_init_rationale_722",
+      "tests_test_init_rationale_752",
+      "tests_test_init_rationale_795",
+      "tests_test_init_rationale_822",
+      "tests_test_init_test_actuator_called_on_water_available_decision",
+      "tests_test_init_test_actuator_called_on_water_cut_decision",
+      "tests_test_init_test_actuator_not_called_again_when_decision_unchanged",
+      "tests_test_init_test_actuator_not_called_when_no_scripts_configured",
+      "tests_test_init_test_actuator_only_calls_configured_side",
+      "tests_test_init_test_async_setup_registers_presence_listener_when_configured",
+      "tests_test_init_test_async_setup_registers_state_listener",
+      "tests_test_init_test_async_setup_uses_custom_decision_log_size",
+      "tests_test_init_test_async_setup_uses_custom_max_humidity_delta",
+      "tests_test_init_test_async_setup_uses_custom_max_session_seconds_without_presence_sensor",
+      "tests_test_init_test_async_setup_uses_custom_threshold_and_cooldown",
+      "tests_test_init_test_async_setup_without_config_is_noop",
+      "tests_test_init_test_async_setup_without_humidity_sensor_is_noop",
+      "tests_test_init_test_cold_shower_stays_available_indefinitely_below_delta",
+      "tests_test_init_test_duration_fallback_cuts_water_via_wiring_without_presence_sensor",
+      "tests_test_init_test_duration_fallback_disabled_via_wiring_with_presence_sensor",
+      "tests_test_init_test_humidity_callback_feeds_detector",
+      "tests_test_init_test_humidity_callback_ignores_missing_new_state",
+      "tests_test_init_test_humidity_callback_ignores_non_numeric_state",
+      "tests_test_init_test_humidity_callback_ignores_unavailable_state",
+      "tests_test_init_test_humidity_callback_records_every_evaluation_in_decision_log",
+      "tests_test_init_test_humidity_callback_records_water_available_decision",
+      "tests_test_init_test_humidity_callback_records_water_cut_when_delta_exceeds_threshold",
+      "tests_test_init_test_humidity_delta_cuts_water_quickly_via_wiring",
+      "tests_test_init_test_no_presence_listener_when_not_configured",
+      "tests_test_init_test_notify_service_called_on_water_cut_decision",
+      "tests_test_init_test_notify_service_not_called_for_water_available_decision",
+      "tests_test_init_test_presence_absent_cuts_water_immediately_during_active_session",
+      "tests_test_init_test_presence_callback_ignores_unknown_state",
+      "tests_test_init_test_presence_sensor_disables_duration_fallback",
+      "tests_test_init_test_sibling_shower_gets_fresh_baseline_after_resume"
+    ],
+    "1": [
+      "tests_test_session",
+      "tests_test_session_make_detector",
+      "tests_test_session_py_datetime",
+      "tests_test_session_rationale_102",
+      "tests_test_session_rationale_121",
+      "tests_test_session_rationale_134",
+      "tests_test_session_rationale_149",
+      "tests_test_session_rationale_163",
+      "tests_test_session_rationale_172",
+      "tests_test_session_rationale_188",
+      "tests_test_session_rationale_215",
+      "tests_test_session_rationale_221",
+      "tests_test_session_rationale_228",
+      "tests_test_session_rationale_239",
+      "tests_test_session_rationale_252",
+      "tests_test_session_rationale_258",
+      "tests_test_session_rationale_265",
+      "tests_test_session_rationale_278",
+      "tests_test_session_rationale_48",
+      "tests_test_session_rationale_56",
+      "tests_test_session_rationale_67",
+      "tests_test_session_rationale_80",
+      "tests_test_session_rationale_89",
+      "tests_test_session_t",
+      "tests_test_session_test_active_enters_cooldown_on_humidity_drop",
+      "tests_test_session_test_active_since_cleared_on_end",
+      "tests_test_session_test_active_since_humidity_cleared_on_end",
+      "tests_test_session_test_active_since_humidity_none_when_idle",
+      "tests_test_session_test_active_since_humidity_resets_on_resume",
+      "tests_test_session_test_active_since_humidity_set_on_start",
+      "tests_test_session_test_active_since_none_when_idle",
+      "tests_test_session_test_active_since_persists_through_cooldown_and_resume",
+      "tests_test_session_test_active_since_set_on_start",
+      "tests_test_session_test_active_stays_active_while_humid",
+      "tests_test_session_test_cooldown_ends_session_after_elapsed",
+      "tests_test_session_test_cooldown_not_expired_no_event",
+      "tests_test_session_test_cooldown_resumes_on_humidity_rise",
+      "tests_test_session_test_custom_cooldown",
+      "tests_test_session_test_custom_threshold",
+      "tests_test_session_test_full_session_lifecycle",
+      "tests_test_session_test_idle_above_threshold_starts_session",
+      "tests_test_session_test_idle_at_threshold_starts_session",
+      "tests_test_session_test_idle_low_humidity_no_change",
+      "tests_test_session_test_state_change_str_is_readable"
+    ],
+    "2": [
+      "configentry",
+      "custom_components_shower_guard_const",
+      "custom_components_shower_guard_decision",
+      "custom_components_shower_guard_decision_decision",
+      "custom_components_shower_guard_decision_decisionengine_evaluate",
+      "custom_components_shower_guard_decision_decisionlog",
+      "custom_components_shower_guard_decision_decisionlog_entries",
+      "custom_components_shower_guard_decision_decisionlog_init",
+      "custom_components_shower_guard_decision_decisionlog_last",
+      "custom_components_shower_guard_decision_decisionlog_len",
+      "custom_components_shower_guard_decision_decisionlog_record",
+      "custom_components_shower_guard_decision_decisionresult",
+      "custom_components_shower_guard_decision_decisionresult_str",
+      "custom_components_shower_guard_decision_py_datetime",
+      "custom_components_shower_guard_decision_py_enum",
+      "custom_components_shower_guard_decision_rationale_105",
+      "custom_components_shower_guard_decision_rationale_189",
+      "custom_components_shower_guard_decision_rationale_203",
+      "custom_components_shower_guard_decision_rationale_208",
+      "custom_components_shower_guard_decision_rationale_213",
+      "custom_components_shower_guard_decision_rationale_27",
+      "custom_components_shower_guard_decision_rationale_34",
+      "custom_components_shower_guard_init",
+      "custom_components_shower_guard_init_async_setup",
+      "custom_components_shower_guard_init_async_setup_entry",
+      "custom_components_shower_guard_init_async_unload_entry",
+      "custom_components_shower_guard_init_rationale_243",
+      "custom_components_shower_guard_init_rationale_249",
+      "custom_components_shower_guard_init_rationale_55",
+      "custom_components_shower_guard_session",
+      "custom_components_shower_guard_session_py_enum",
+      "custom_components_shower_guard_session_rationale_22",
+      "custom_components_shower_guard_session_rationale_29",
+      "custom_components_shower_guard_session_sessionevent",
+      "custom_components_shower_guard_session_sessionstate",
+      "homeassistant",
+      "tests_test_decision_rationale_279",
+      "tests_test_decision_test_decision_log_starts_empty",
+      "tests_test_init_fakeservices",
+      "tests_test_init_fakeservices_async_call",
+      "tests_test_init_fakeservices_init",
+      "tests_test_init_rationale_34"
+    ],
+    "3": [
+      "custom_components_shower_guard_decision_decisionengine",
+      "custom_components_shower_guard_decision_decisionengine_init",
+      "custom_components_shower_guard_decision_rationale_57",
+      "tests_test_decision",
+      "tests_test_decision_py_datetime",
+      "tests_test_decision_rationale_108",
+      "tests_test_decision_rationale_117",
+      "tests_test_decision_rationale_134",
+      "tests_test_decision_rationale_148",
+      "tests_test_decision_rationale_163",
+      "tests_test_decision_rationale_176",
+      "tests_test_decision_rationale_191",
+      "tests_test_decision_rationale_207",
+      "tests_test_decision_rationale_228",
+      "tests_test_decision_rationale_243",
+      "tests_test_decision_rationale_266",
+      "tests_test_decision_rationale_287",
+      "tests_test_decision_rationale_302",
+      "tests_test_decision_rationale_38",
+      "tests_test_decision_rationale_50",
+      "tests_test_decision_rationale_64",
+      "tests_test_decision_rationale_80",
+      "tests_test_decision_rationale_95",
+      "tests_test_decision_t",
+      "tests_test_decision_test_cold_shower_low_delta_stays_available_indefinitely",
+      "tests_test_decision_test_cooldown_state_delta_still_evaluated",
+      "tests_test_decision_test_custom_max_humidity_delta",
+      "tests_test_decision_test_decision_log_evicts_oldest_beyond_max_entries",
+      "tests_test_decision_test_decision_log_records_entries_in_order",
+      "tests_test_decision_test_decision_result_str_is_readable",
+      "tests_test_decision_test_duration_fallback_cuts_water_when_enabled",
+      "tests_test_decision_test_duration_fallback_disabled_by_default",
+      "tests_test_decision_test_duration_fallback_does_not_trigger_before_limit",
+      "tests_test_decision_test_humidity_delta_at_threshold_cuts_water",
+      "tests_test_decision_test_humidity_delta_takes_priority_over_duration_fallback",
+      "tests_test_decision_test_humidity_delta_within_threshold_stays_available",
+      "tests_test_decision_test_idle_state_water_available",
+      "tests_test_decision_test_missing_humidity_data_has_no_cutoff",
+      "tests_test_decision_test_presence_absent_but_idle_stays_water_available",
+      "tests_test_decision_test_presence_absent_cuts_water_immediately",
+      "tests_test_decision_test_presence_absent_takes_priority_over_duration_fallback",
+      "tests_test_decision_test_presence_present_falls_back_to_humidity_delta_policy"
+    ],
+    "4": [
+      "custom_components_shower_guard_replay",
+      "custom_components_shower_guard_replay_load_readings_from_csv",
+      "custom_components_shower_guard_replay_main",
+      "custom_components_shower_guard_replay_rationale_47",
+      "custom_components_shower_guard_replay_rationale_80",
+      "custom_components_shower_guard_replay_rationale_95",
+      "custom_components_shower_guard_replay_replay",
+      "reading",
+      "tests_test_replay",
+      "tests_test_replay_py_datetime",
+      "tests_test_replay_rationale_47",
+      "tests_test_replay_rationale_78",
+      "tests_test_replay_t",
+      "tests_test_replay_test_csv_readings_can_be_replayed",
+      "tests_test_replay_test_load_readings_from_csv",
+      "tests_test_replay_test_replay_decision_log_respects_size_limit",
+      "tests_test_replay_test_replay_duration_fallback_cuts_water_when_enabled",
+      "tests_test_replay_test_replay_duration_fallback_disabled_by_default",
+      "tests_test_replay_test_replay_empty_readings_produces_empty_result",
+      "tests_test_replay_test_replay_full_session_lifecycle",
+      "tests_test_replay_test_replay_records_a_decision_per_reading",
+      "tests_test_replay_test_replay_respects_custom_threshold_and_cooldown",
+      "tests_test_replay_test_replay_water_cut_when_humidity_delta_exceeds_threshold"
+    ],
+    "5": [
+      "custom_components_shower_guard_replay_rationale_33",
+      "custom_components_shower_guard_replay_replayresult",
+      "custom_components_shower_guard_session_py_datetime",
+      "custom_components_shower_guard_session_rationale_101",
+      "custom_components_shower_guard_session_rationale_111",
+      "custom_components_shower_guard_session_rationale_37",
+      "custom_components_shower_guard_session_rationale_54",
+      "custom_components_shower_guard_session_rationale_87",
+      "custom_components_shower_guard_session_rationale_92",
+      "custom_components_shower_guard_session_sessiondetector",
+      "custom_components_shower_guard_session_sessiondetector_active_since",
+      "custom_components_shower_guard_session_sessiondetector_active_since_humidity",
+      "custom_components_shower_guard_session_sessiondetector_from_active",
+      "custom_components_shower_guard_session_sessiondetector_from_cooldown",
+      "custom_components_shower_guard_session_sessiondetector_from_idle",
+      "custom_components_shower_guard_session_sessiondetector_init",
+      "custom_components_shower_guard_session_sessiondetector_state",
+      "custom_components_shower_guard_session_sessiondetector_transition",
+      "custom_components_shower_guard_session_sessiondetector_update",
+      "custom_components_shower_guard_session_statechange",
+      "custom_components_shower_guard_session_statechange_str"
+    ],
+    "6": [
+      "custom_components_shower_guard_manifest",
+      "custom_components_shower_guard_manifest_codeowners",
+      "custom_components_shower_guard_manifest_dependencies",
+      "custom_components_shower_guard_manifest_documentation",
+      "custom_components_shower_guard_manifest_domain",
+      "custom_components_shower_guard_manifest_iot_class",
+      "custom_components_shower_guard_manifest_issue_tracker",
+      "custom_components_shower_guard_manifest_name",
+      "custom_components_shower_guard_manifest_requirements",
+      "custom_components_shower_guard_manifest_version"
+    ],
+    "7": [
+      "tests_test_scaffold",
+      "tests_test_scaffold_rationale_25",
+      "tests_test_scaffold_rationale_31",
+      "tests_test_scaffold_rationale_39",
+      "tests_test_scaffold_rationale_51",
+      "tests_test_scaffold_test_const_domain",
+      "tests_test_scaffold_test_const_version",
+      "tests_test_scaffold_test_manifest_domain",
+      "tests_test_scaffold_test_manifest_exists"
+    ],
+    "8": [
+      "tools_restart",
+      "tools_restart_sh__entry"
+    ],
+    "9": [
+      "tests_init"
+    ]
+  },
+  "cohesion": {
+    "0": 0.11416490486257928,
+    "1": 0.08562367864693446,
+    "2": 0.07317073170731707,
+    "3": 0.09059233449477352,
+    "4": 0.18972332015810275,
+    "5": 0.16666666666666666,
+    "6": 0.2,
+    "7": 0.2222222222222222,
+    "8": 1.0,
+    "9": 1.0
+  },
+  "gods": [
+    {
+      "id": "tests_test_init_make_hass",
+      "label": "make_hass()",
+      "degree": 33
+    },
+    {
+      "id": "tests_test_init_patch_track_state_change",
+      "label": "patch_track_state_change()",
+      "degree": 31
+    },
+    {
+      "id": "custom_components_shower_guard_decision_decisionengine",
+      "label": "DecisionEngine",
+      "degree": 29
+    },
+    {
+      "id": "tests_test_session_make_detector",
+      "label": "make_detector()",
+      "degree": 22
+    },
+    {
+      "id": "tests_test_decision_t",
+      "label": "t()",
+      "degree": 20
+    },
+    {
+      "id": "tests_test_session_t",
+      "label": "t()",
+      "degree": 19
+    },
+    {
+      "id": "custom_components_shower_guard_replay_replay",
+      "label": "replay()",
+      "degree": 18
+    },
+    {
+      "id": "custom_components_shower_guard_session_sessiondetector",
+      "label": "SessionDetector",
+      "degree": 18
+    },
+    {
+      "id": "custom_components_shower_guard_decision_decisionlog",
+      "label": "DecisionLog",
+      "degree": 17
+    },
+    {
+      "id": "custom_components_shower_guard_session_sessionstate",
+      "label": "SessionState",
+      "degree": 16
+    }
+  ],
+  "surprises": [
+    {
+      "source": "FakeServices",
+      "target": "Decision",
+      "source_files": [
+        "tests/test_init.py",
+        "custom_components/shower_guard/decision.py"
+      ],
+      "confidence": "INFERRED",
+      "relation": "uses",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories"
+    },
+    {
+      "source": "test_decision_log_evicts_oldest_beyond_max_entries()",
+      "target": "DecisionLog",
+      "source_files": [
+        "tests/test_decision.py",
+        "custom_components/shower_guard/decision.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "why": "connects across different repos/directories; bridges separate communities"
+    },
+    {
+      "source": "test_decision_log_records_entries_in_order()",
+      "target": "DecisionLog",
+      "source_files": [
+        "tests/test_decision.py",
+        "custom_components/shower_guard/decision.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "why": "connects across different repos/directories; bridges separate communities"
+    },
+    {
+      "source": "test_replay_empty_readings_produces_empty_result()",
+      "target": "replay()",
+      "source_files": [
+        "tests/test_replay.py",
+        "custom_components/shower_guard/replay.py"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "why": "connects across different repos/directories; peripheral node `test_replay_empty_readings_produces_empty_result()` unexpectedly reaches hub `replay()`"
+    },
+    {
+      "source": "FakeServices",
+      "target": "SessionState",
+      "source_files": [
+        "tests/test_init.py",
+        "custom_components/shower_guard/session.py"
+      ],
+      "confidence": "INFERRED",
+      "relation": "uses",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories"
+    }
+  ],
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `SessionState` connect `DecisionLog` to `test_init.py`, `test_session.py`, `DecisionEngine`, `test_replay.py`, `SessionDetector`?",
+      "why": "High betweenness centrality (0.218) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `DecisionEngine` connect `DecisionEngine` to `DecisionLog`, `test_replay.py`, `SessionDetector`?",
+      "why": "High betweenness centrality (0.134) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `SessionDetector` connect `SessionDetector` to `test_session.py`, `DecisionLog`, `test_replay.py`?",
+      "why": "High betweenness centrality (0.107) - this node is a cross-community bridge."
+    },
+    {
+      "type": "verify_inferred",
+      "question": "Are the 2 inferred relationships involving `DecisionEngine` (e.g. with `SessionState` and `ReplayResult`) actually correct?",
+      "why": "`DecisionEngine` has 2 INFERRED edges - model-reasoned connections that need verification."
+    },
+    {
+      "type": "isolated_nodes",
+      "question": "What connects `domain`, `name`, `version` to the rest of the system?",
+      "why": "10 weakly-connected nodes found - possible documentation gaps or missing edges."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `test_init.py` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.11416490486257928 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `test_session.py` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.08562367864693446 - nodes in this community are weakly interconnected."
+    }
+  ]
+}
