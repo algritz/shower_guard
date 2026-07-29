@@ -48,6 +48,7 @@ shower_guard:
   decision_log_size: 100                               # optional — default 100 entries
   water_cut_script: script.cut_water                   # optional — called when water is cut
   water_available_script: script.restore_water         # optional — called when water is restored
+  notify_service: mobile_app_your_phone                 # optional — notify.<service> target for WATER_CUT only
 ```
 
 The Sensor Layer listens for state changes on `humidity_sensor` and feeds each

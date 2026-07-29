@@ -39,3 +39,5 @@ Thumbs.db
 Shower_Guard_Project_Prompt.pdf
 tools/deploy.sh
 tools/pull.sh
+
+graphify-out/

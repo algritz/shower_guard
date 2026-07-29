@@ -52,3 +52,7 @@ CONF_PRESENCE_SENSOR = "presence_sensor"
 # decision remains dry run (computed and logged only).
 CONF_WATER_CUT_SCRIPT = "water_cut_script"
 CONF_WATER_AVAILABLE_SCRIPT = "water_available_script"
+
+# Optional mobile notification on water cut (ADR-0002).
+# Must be a Home Assistant notify service name, e.g. mobile_app_your_phone.
+CONF_NOTIFY_SERVICE = "notify_service"

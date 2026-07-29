@@ -547,6 +547,78 @@ def test_actuator_called_on_water_cut_decision():
     ]
 
 
+def test_notify_service_called_on_water_cut_decision():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "max_humidity_delta": 0,
+                    "water_cut_script": "script.cut_water",
+                    "notify_service": "mobile_app_your_phone",
+                }
+            },
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    asyncio.run(captured["callback"](event))
+
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_CUT
+    assert hass.services.calls == [
+        {
+            "domain": "script",
+            "service": "turn_on",
+            "service_data": {"entity_id": "script.cut_water"},
+            "blocking": False,
+        },
+        {
+            "domain": "notify",
+            "service": "mobile_app_your_phone",
+            "service_data": {
+                "title": "Shower Guard",
+                "message": "Water has been cut by Shower Guard.",
+            },
+            "blocking": False,
+        },
+    ]
+
+
+def test_notify_service_not_called_for_water_available_decision():
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "water_available_script": "script.restore_water",
+                    "notify_service": "mobile_app_your_phone",
+                }
+            },
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
+
+    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+    assert hass.services.calls == [
+        {
+            "domain": "script",
+            "service": "turn_on",
+            "service_data": {"entity_id": "script.restore_water"},
+            "blocking": False,
+        }
+    ]
+
+
 def test_actuator_not_called_again_when_decision_unchanged():
     hass = make_hass()
     captured = patch_track_state_change()

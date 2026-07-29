@@ -26,6 +26,7 @@ from .const import (
     CONF_HUMIDITY_THRESHOLD,
     CONF_MAX_HUMIDITY_DELTA,
     CONF_MAX_SESSION_SECONDS,
+    CONF_NOTIFY_SERVICE,
     CONF_PRESENCE_SENSOR,
     CONF_WATER_AVAILABLE_SCRIPT,
     CONF_WATER_CUT_SCRIPT,
@@ -109,6 +110,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     water_cut_script = domain_config.get(CONF_WATER_CUT_SCRIPT)
     water_available_script = domain_config.get(CONF_WATER_AVAILABLE_SCRIPT)
+    notify_service = domain_config.get(CONF_NOTIFY_SERVICE)
 
     async def _call_actuator(decision: Decision) -> None:
         """Call the HA script (if configured) for the given decision. Never
@@ -117,28 +119,48 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         script_entity_id = (
             water_cut_script if decision is Decision.WATER_CUT else water_available_script
         )
-        if not script_entity_id:
+        if script_entity_id:
+            try:
+                await hass.services.async_call(
+                    "script", "turn_on", {"entity_id": script_entity_id}, blocking=False
+                )
+                _LOGGER.info(
+                    "Shower Guard: called actuator script %s for %s",
+                    script_entity_id,
+                    decision.value,
+                )
+            except Exception:  # noqa: BLE001 - HA service calls can raise various errors
+                _LOGGER.exception(
+                    "Shower Guard: failed to call actuator script %s for %s",
+                    script_entity_id,
+                    decision.value,
+                )
+        else:
             _LOGGER.debug(
                 "Shower Guard: no actuator script configured for %s; dry run only",
                 decision.value,
             )
-            return
 
-        try:
-            await hass.services.async_call(
-                "script", "turn_on", {"entity_id": script_entity_id}, blocking=False
-            )
-            _LOGGER.info(
-                "Shower Guard: called actuator script %s for %s",
-                script_entity_id,
-                decision.value,
-            )
-        except Exception:  # noqa: BLE001 - HA service calls can raise various errors
-            _LOGGER.exception(
-                "Shower Guard: failed to call actuator script %s for %s",
-                script_entity_id,
-                decision.value,
-            )
+        if decision is Decision.WATER_CUT and notify_service:
+            try:
+                await hass.services.async_call(
+                    "notify",
+                    notify_service,
+                    {
+                        "title": "Shower Guard",
+                        "message": "Water has been cut by Shower Guard.",
+                    },
+                    blocking=False,
+                )
+                _LOGGER.info(
+                    "Shower Guard: sent notification %s for water cut",
+                    notify_service,
+                )
+            except Exception:  # noqa: BLE001 - HA service calls can raise various errors
+                _LOGGER.exception(
+                    "Shower Guard: failed to send notification %s for water cut",
+                    notify_service,
+                )
 
     async def _evaluate_and_record(now: datetime) -> None:
         """Evaluate the Decision Engine, record the result, and — on a
