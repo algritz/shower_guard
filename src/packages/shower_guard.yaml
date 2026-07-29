@@ -1,0 +1,131 @@
+###############################################################################
+#
+# Shower Guard
+#
+# Version : 1.1.0
+#
+# Purpose
+# -------
+# Surface the Shower Guard custom component's internal state as HA entities
+# so they can be used in dashboards, automations, and notifications.
+#
+# The custom component owns all session detection and decision logic.
+# This package only adds helpers and template sensors that mirror its state.
+#
+###############################################################################
+
+###############################################################################
+# Helpers
+###############################################################################
+
+input_boolean:
+
+  shower_guard_pump_should_be_off:
+    name: Shower Guard — Pump Should Be Off
+    icon: mdi:water-off
+
+###############################################################################
+# Template sensors
+# These mirror the component's internal state as proper HA entities.
+###############################################################################
+
+template:
+
+  - sensor:
+
+      - name: Shower Guard Session State
+        unique_id: shower_guard_session_state
+        icon: mdi:shower
+        state: >
+          {% set h = states('sensor.third_reality_inc_3rths0224z_humidity') | float(0) %}
+          {% set threshold = 75.0 %}
+          {% if h >= threshold %}
+            active
+          {% else %}
+            idle
+          {% endif %}
+
+      - name: Shower Guard Humidity
+        unique_id: shower_guard_humidity
+        unit_of_measurement: "%"
+        state_class: measurement
+        device_class: humidity
+        icon: mdi:water-percent
+        state: >
+          {{ states('sensor.third_reality_inc_3rths0224z_humidity') | float(0) | round(1) }}
+
+      - name: Shower Guard Presence
+        unique_id: shower_guard_presence
+        icon: mdi:motion-sensor
+        state: >
+          {% if states('binary_sensor.bathroom_movement_detector_bathroom') == 'on' %}
+            detected
+          {% elif states('binary_sensor.bathroom_movement_detector_bathroom') == 'off' %}
+            clear
+          {% else %}
+            unknown
+          {% endif %}
+
+      - name: Shower Guard Pump State
+        unique_id: shower_guard_pump_state
+        icon: mdi:water-pump
+        state: >
+          {% if is_state('input_boolean.shower_guard_pump_should_be_off', 'on') %}
+            off
+          {% else %}
+            on
+          {% endif %}
+
+  - binary_sensor:
+
+      - name: Shower Guard Session Active
+        unique_id: shower_guard_session_active
+        device_class: running
+        icon: mdi:shower-head
+        state: >
+          {{ states('sensor.third_reality_inc_3rths0224z_humidity') | float(0) >= 75.0 }}
+
+      - name: Shower Guard Presence Detected
+        unique_id: shower_guard_presence_detected
+        device_class: motion
+        state: >
+          {{ states('binary_sensor.bathroom_movement_detector_bathroom') == 'on' }}
+
+      - name: Shower Guard Pump Should Be Off
+        unique_id: shower_guard_pump_should_be_off_sensor
+        device_class: running
+        icon: mdi:water-pump-off
+        state: >
+          {{ is_state('input_boolean.shower_guard_pump_should_be_off', 'on') }}
+
+###############################################################################
+# Scripts — actuator abstraction (ADR-0001)
+# The component calls these; they own the actual device control.
+# Edit the actions below to match your deployment target.
+###############################################################################
+
+script:
+
+  shower_guard_cut_water:
+    alias: Shower Guard — Cut Water
+    icon: mdi:water-off
+    sequence:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.shower_guard_pump_should_be_off
+      - action: persistent_notification.create
+        data:
+          title: "Shower Guard"
+          message: "Water cut — shower session exceeded limits."
+          notification_id: shower_guard_decision
+
+  shower_guard_restore_water:
+    alias: Shower Guard — Restore Water
+    icon: mdi:water
+    sequence:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.shower_guard_pump_should_be_off
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: shower_guard_decision

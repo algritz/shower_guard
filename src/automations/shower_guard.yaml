@@ -1,0 +1,20 @@
+- id: '1784679160968'
+  alias: Shower Started
+  triggers:
+  - entity_id:
+    - sensor.bathroom_third_reality_inc_3rths0224z_bathroom_humidity_rate
+    above: input_number.shower_baseline
+    trigger: numeric_state
+  conditions:
+  - condition: state
+    entity_id: input_boolean.shower_active
+    state: 'off'
+  actions:
+  - target:
+      entity_id: input_number.shower_baseline
+    data:
+      value: '{{ states(''sensor.third_reality_inc_3rths0224z_humidity'') }}'
+    action: input_number.set_value
+  - target:
+      entity_id: input_boolean.shower_active
+    action: input_boolean.turn_on
