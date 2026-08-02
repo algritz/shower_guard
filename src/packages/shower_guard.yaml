@@ -46,7 +46,7 @@ template:
         device_class: humidity
         icon: mdi:water-percent
         state: >
-          {{ states('sensor.third_reality_inc_3rths0224z_humidity') | float(0) | round(1) }}
+              {{ states('sensor.bathroom_third_reality_inc_3rths0224z_humidity') | float(0) | round(1) }}
 
       - name: Shower Guard Presence
         unique_id: shower_guard_presence
@@ -77,7 +77,7 @@ template:
         device_class: running
         icon: mdi:shower-head
         state: >
-          {{ states('sensor.third_reality_inc_3rths0224z_humidity') | float(0) >= 75.0 }}
+              {{ states('sensor.bathroom_third_reality_inc_3rths0224z_humidity') | float(0) >= 75.0 }}
 
       - name: Shower Guard Presence Detected
         unique_id: shower_guard_presence_detected
