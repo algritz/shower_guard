@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 1.2.0
+# version: 1.3.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Session Detection
 # Humidity level (% RH) that triggers session start.
@@ -64,3 +64,9 @@ CONF_NOTIFY_SERVICE = "notify_service"
 # tracking (start-of-session reading, reset on RESUMED) that only
 # session.py/decision.py may own, per ADR-0001.
 ENTITY_ID_HUMIDITY_DELTA = f"sensor.{DOMAIN}_humidity_delta"
+
+# The session's current baseline reading (see
+# SessionDetector.active_since_humidity) — the reference point the delta
+# above is measured from. Published alongside the delta for the same reason:
+# so a dashboard can show it without any YAML/template re-tracking it.
+ENTITY_ID_SESSION_BASELINE_HUMIDITY = f"sensor.{DOMAIN}_baseline_humidity"

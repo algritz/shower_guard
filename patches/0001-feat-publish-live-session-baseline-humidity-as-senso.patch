@@ -1,0 +1,213 @@
+From 3be45c3acbd0017dad909c1dd36b5c56cf79325b Mon Sep 17 00:00:00 2001
+From: "Claude (draft)" <assistant@example.com>
+Date: Mon, 3 Aug 2026 10:14:27 +0000
+Subject: [PATCH] feat: publish live session baseline humidity as
+ sensor.shower_guard_baseline_humidity
+
+Exposes SessionDetector.active_since_humidity (the reference point
+max_humidity_delta is measured from) as its own HA entity, alongside
+the existing humidity delta sensor. Published on every Decision Engine
+evaluation, showing 'unknown' when no session is active.
+
+No new duplicated logic - this is the same baseline the Decision
+Engine already computes deltas against (see ADR-0001); the wiring
+layer just publishes what session.py already tracks internally,
+including its reset on RESUMED for sibling showers.
+
+Bumps version to 1.3.0.
+---
+ custom_components/shower_guard/__init__.py   | 34 +++++++----
+ custom_components/shower_guard/const.py      | 10 ++-
+ custom_components/shower_guard/manifest.json |  2 +-
+ tests/test_init.py                           | 64 ++++++++++++++++++++
+ 4 files changed, 96 insertions(+), 14 deletions(-)
+
+diff --git a/custom_components/shower_guard/__init__.py b/custom_components/shower_guard/__init__.py
+index bc7074e..546d694 100644
+--- a/custom_components/shower_guard/__init__.py
++++ b/custom_components/shower_guard/__init__.py
+@@ -38,6 +38,7 @@ from .const import (
+     DEFAULT_MAX_SESSION_SECONDS,
+     DOMAIN,
+     ENTITY_ID_HUMIDITY_DELTA,
++    ENTITY_ID_SESSION_BASELINE_HUMIDITY,
+     VERSION,
+ )
+ from .decision import Decision, DecisionEngine, DecisionLog
+@@ -164,13 +165,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+                     notify_service,
+                 )
+ 
+-    def _publish_humidity_delta(result) -> None:
+-        """Publish the Decision Engine's current humidity delta as a plain HA
+-        state, on every evaluation (not just decision changes) — so a
++    def _publish_decision_state(result, baseline_humidity) -> None:
++        """Publish the Decision Engine's current humidity delta, and the
++        session's current baseline reading it's measured from, as plain HA
++        states — on every evaluation (not just decision changes) — so a
+         dashboard can show live progress toward max_humidity_delta. This is
+-        the only place that computes/exposes the delta; nothing else should
+-        recompute it (see ADR-0001 — baseline tracking, including the reset
+-        on RESUMED, belongs solely to session.py/decision.py)."""
++        the only place that computes/exposes either value; nothing else
++        should recompute or re-track them (see ADR-0001 — baseline tracking,
++        including the reset on RESUMED, belongs solely to
++        session.py/decision.py)."""
+         delta = result.humidity_delta
+         hass.states.async_set(
+             ENTITY_ID_HUMIDITY_DELTA,
+@@ -182,13 +185,22 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+                 "max_humidity_delta": engine.max_humidity_delta,
+             },
+         )
++        hass.states.async_set(
++            ENTITY_ID_SESSION_BASELINE_HUMIDITY,
++            f"{baseline_humidity:.1f}" if baseline_humidity is not None else STATE_UNKNOWN,
++            {
++                "unit_of_measurement": "%",
++                "friendly_name": "Shower Guard Baseline Humidity",
++                "icon": "mdi:water-outline",
++            },
++        )
+ 
+     async def _evaluate_and_record(now: datetime) -> None:
+         """Evaluate the Decision Engine, record the result, publish the
+-        current humidity delta, and — on a decision change — call the
+-        configured actuator script. Shared by the humidity and presence
+-        callbacks so a presence change alone can trigger a re-evaluation and
+-        actuation."""
++        current humidity delta and baseline, and — on a decision change —
++        call the configured actuator script. Shared by the humidity and
++        presence callbacks so a presence change alone can trigger a
++        re-evaluation and actuation."""
+         result = engine.evaluate(
+             detector.state,
+             detector.active_since,
+@@ -198,7 +210,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+             presence=hass.data[DOMAIN]["presence"],
+         )
+         decision_log.record(result)
+-        _publish_humidity_delta(result)
++        _publish_decision_state(result, detector.active_since_humidity)
+         previous = hass.data[DOMAIN]["last_decision"]
+         hass.data[DOMAIN]["last_decision"] = result
+         if previous is None or result.decision != previous.decision:
+diff --git a/custom_components/shower_guard/const.py b/custom_components/shower_guard/const.py
+index f955ed6..8e87f65 100644
+--- a/custom_components/shower_guard/const.py
++++ b/custom_components/shower_guard/const.py
+@@ -1,11 +1,11 @@
+ # ---
+ # purpose: Central constants for the Shower Guard integration.
+-# version: 1.2.0
++# version: 1.3.0
+ # note: Add new constants here. Never scatter magic strings across modules.
+ # ---
+ 
+ DOMAIN = "shower_guard"
+-VERSION = "1.2.0"
++VERSION = "1.3.0"
+ 
+ # Session Detection
+ # Humidity level (% RH) that triggers session start.
+@@ -64,3 +64,9 @@ CONF_NOTIFY_SERVICE = "notify_service"
+ # tracking (start-of-session reading, reset on RESUMED) that only
+ # session.py/decision.py may own, per ADR-0001.
+ ENTITY_ID_HUMIDITY_DELTA = f"sensor.{DOMAIN}_humidity_delta"
++
++# The session's current baseline reading (see
++# SessionDetector.active_since_humidity) — the reference point the delta
++# above is measured from. Published alongside the delta for the same reason:
++# so a dashboard can show it without any YAML/template re-tracking it.
++ENTITY_ID_SESSION_BASELINE_HUMIDITY = f"sensor.{DOMAIN}_baseline_humidity"
+diff --git a/custom_components/shower_guard/manifest.json b/custom_components/shower_guard/manifest.json
+index fbd6bcb..e0e7538 100644
+--- a/custom_components/shower_guard/manifest.json
++++ b/custom_components/shower_guard/manifest.json
+@@ -1,7 +1,7 @@
+ {
+ 	"domain": "shower_guard",
+ 	"name": "Shower Guard",
+-	"version": "1.2.0",
++	"version": "1.3.0",
+ 	"documentation": "https://github.com/algritz/shower_guard",
+ 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
+ 	"dependencies": [],
+diff --git a/tests/test_init.py b/tests/test_init.py
+index 26aa1b0..75fcabe 100644
+--- a/tests/test_init.py
++++ b/tests/test_init.py
+@@ -755,6 +755,70 @@ def test_humidity_delta_published_as_unknown_when_idle():
+     assert published["state"] == "unknown"
+ 
+ 
++def test_baseline_humidity_published_on_session_start():
++    """Session start publishes the baseline as the STARTED reading."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
++        )
++    )
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="76.0")})
++    asyncio.run(captured["callback"](event))
++
++    published = hass.states.get("sensor.shower_guard_baseline_humidity")
++    assert published["state"] == "76.0"
++    assert published["attributes"]["unit_of_measurement"] == "%"
++
++
++def test_baseline_humidity_published_as_unknown_when_idle():
++    """No active session -> baseline is None -> published as unknown."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
++        )
++    )
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(captured["callback"](event))
++
++    published = hass.states.get("sensor.shower_guard_baseline_humidity")
++    assert published["state"] == "unknown"
++
++
++def test_baseline_humidity_resets_on_sibling_resume():
++    """Baseline published entity reflects the RESUMED reading (fresh
++    baseline for a sibling shower), not the original STARTED reading —
++    mirrors detector.active_since_humidity's own reset behavior."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass,
++            {
++                DOMAIN: {
++                    "humidity_sensor": "sensor.bathroom_humidity",
++                    "cooldown_seconds": 300,
++                }
++            },
++        )
++    )
++
++    for state in ("75.0", "60.0", "76.0"):  # start, cooldown, resume (sibling)
++        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
++        asyncio.run(captured["callback"](event))
++
++    published = hass.states.get("sensor.shower_guard_baseline_humidity")
++    assert published["state"] == "76.0"
++
++
+ # ---------------------------------------------------------------------------
+ # Humidity delta wiring (v1.1 — the sole cutoff trigger besides presence)
+ # ---------------------------------------------------------------------------
+-- 
+2.43.0
+

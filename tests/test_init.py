@@ -755,6 +755,70 @@ def test_humidity_delta_published_as_unknown_when_idle():
     assert published["state"] == "unknown"
 
 
+def test_baseline_humidity_published_on_session_start():
+    """Session start publishes the baseline as the STARTED reading."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="76.0")})
+    asyncio.run(captured["callback"](event))
+
+    published = hass.states.get("sensor.shower_guard_baseline_humidity")
+    assert published["state"] == "76.0"
+    assert published["attributes"]["unit_of_measurement"] == "%"
+
+
+def test_baseline_humidity_published_as_unknown_when_idle():
+    """No active session -> baseline is None -> published as unknown."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
+
+    published = hass.states.get("sensor.shower_guard_baseline_humidity")
+    assert published["state"] == "unknown"
+
+
+def test_baseline_humidity_resets_on_sibling_resume():
+    """Baseline published entity reflects the RESUMED reading (fresh
+    baseline for a sibling shower), not the original STARTED reading —
+    mirrors detector.active_since_humidity's own reset behavior."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "cooldown_seconds": 300,
+                }
+            },
+        )
+    )
+
+    for state in ("75.0", "60.0", "76.0"):  # start, cooldown, resume (sibling)
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+        asyncio.run(captured["callback"](event))
+
+    published = hass.states.get("sensor.shower_guard_baseline_humidity")
+    assert published["state"] == "76.0"
+
+
 # ---------------------------------------------------------------------------
 # Humidity delta wiring (v1.1 — the sole cutoff trigger besides presence)
 # ---------------------------------------------------------------------------
