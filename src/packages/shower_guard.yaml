@@ -85,12 +85,12 @@ template:
         state: >
           {{ states('binary_sensor.bathroom_movement_detector_bathroom') == 'on' }}
 
-      - name: Shower Guard Pump Should Be Off
-        unique_id: shower_guard_pump_should_be_off_sensor
+      - name: Shower Guard Water Available
+        unique_id: shower_guard_water_available
         device_class: running
-        icon: mdi:water-pump-off
+        icon: mdi:water
         state: >
-          {{ is_state('input_boolean.shower_guard_pump_should_be_off', 'on') }}
+          {{ is_state('input_boolean.shower_guard_pump_should_be_off', 'off') }}
 
 ###############################################################################
 # Scripts — actuator abstraction (ADR-0001)
