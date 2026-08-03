@@ -1,0 +1,326 @@
+diff --git a/custom_components/shower_guard/__init__.py b/custom_components/shower_guard/__init__.py
+index 5712aef..bc7074e 100644
+--- a/custom_components/shower_guard/__init__.py
++++ b/custom_components/shower_guard/__init__.py
+@@ -15,6 +15,7 @@
+ import logging
+ from datetime import datetime
+ 
++from homeassistant.const import STATE_UNKNOWN
+ from homeassistant.core import HomeAssistant
+ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.helpers.event import async_track_state_change_event
+@@ -36,6 +37,7 @@ from .const import (
+     DEFAULT_MAX_HUMIDITY_DELTA,
+     DEFAULT_MAX_SESSION_SECONDS,
+     DOMAIN,
++    ENTITY_ID_HUMIDITY_DELTA,
+     VERSION,
+ )
+ from .decision import Decision, DecisionEngine, DecisionLog
+@@ -162,11 +164,31 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+                     notify_service,
+                 )
+ 
++    def _publish_humidity_delta(result) -> None:
++        """Publish the Decision Engine's current humidity delta as a plain HA
++        state, on every evaluation (not just decision changes) — so a
++        dashboard can show live progress toward max_humidity_delta. This is
++        the only place that computes/exposes the delta; nothing else should
++        recompute it (see ADR-0001 — baseline tracking, including the reset
++        on RESUMED, belongs solely to session.py/decision.py)."""
++        delta = result.humidity_delta
++        hass.states.async_set(
++            ENTITY_ID_HUMIDITY_DELTA,
++            f"{delta:.1f}" if delta is not None else STATE_UNKNOWN,
++            {
++                "unit_of_measurement": "%",
++                "friendly_name": "Shower Guard Humidity Delta",
++                "icon": "mdi:delta",
++                "max_humidity_delta": engine.max_humidity_delta,
++            },
++        )
++
+     async def _evaluate_and_record(now: datetime) -> None:
+-        """Evaluate the Decision Engine, record the result, and — on a
+-        decision change — call the configured actuator script. Shared by the
+-        humidity and presence callbacks so a presence change alone can
+-        trigger a re-evaluation and actuation."""
++        """Evaluate the Decision Engine, record the result, publish the
++        current humidity delta, and — on a decision change — call the
++        configured actuator script. Shared by the humidity and presence
++        callbacks so a presence change alone can trigger a re-evaluation and
++        actuation."""
+         result = engine.evaluate(
+             detector.state,
+             detector.active_since,
+@@ -176,6 +198,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+             presence=hass.data[DOMAIN]["presence"],
+         )
+         decision_log.record(result)
++        _publish_humidity_delta(result)
+         previous = hass.data[DOMAIN]["last_decision"]
+         hass.data[DOMAIN]["last_decision"] = result
+         if previous is None or result.decision != previous.decision:
+diff --git a/custom_components/shower_guard/const.py b/custom_components/shower_guard/const.py
+index 4b341b4..f955ed6 100644
+--- a/custom_components/shower_guard/const.py
++++ b/custom_components/shower_guard/const.py
+@@ -1,11 +1,11 @@
+ # ---
+ # purpose: Central constants for the Shower Guard integration.
+-# version: 1.1.0
++# version: 1.2.0
+ # note: Add new constants here. Never scatter magic strings across modules.
+ # ---
+ 
+ DOMAIN = "shower_guard"
+-VERSION = "1.1.0"
++VERSION = "1.2.0"
+ 
+ # Session Detection
+ # Humidity level (% RH) that triggers session start.
+@@ -56,3 +56,11 @@ CONF_WATER_AVAILABLE_SCRIPT = "water_available_script"
+ # Optional mobile notification on water cut (ADR-0002).
+ # Must be a Home Assistant notify service name, e.g. mobile_app_your_phone.
+ CONF_NOTIFY_SERVICE = "notify_service"
++
++# Live decision output, published as a plain HA state (see __init__.py's
++# _publish_humidity_delta) — not an entity platform, consistent with this
++# integration's lightweight, config-flow-free style. Exists so dashboards can
++# show progress toward max_humidity_delta without duplicating the baseline
++# tracking (start-of-session reading, reset on RESUMED) that only
++# session.py/decision.py may own, per ADR-0001.
++ENTITY_ID_HUMIDITY_DELTA = f"sensor.{DOMAIN}_humidity_delta"
+diff --git a/custom_components/shower_guard/manifest.json b/custom_components/shower_guard/manifest.json
+index 12068b2..fbd6bcb 100644
+--- a/custom_components/shower_guard/manifest.json
++++ b/custom_components/shower_guard/manifest.json
+@@ -1,7 +1,7 @@
+ {
+ 	"domain": "shower_guard",
+ 	"name": "Shower Guard",
+-	"version": "1.1.0",
++	"version": "1.2.0",
+ 	"documentation": "https://github.com/algritz/shower_guard",
+ 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
+ 	"dependencies": [],
+diff --git a/tests/test_actuator_integration.py b/tests/test_actuator_integration.py
+index e7646e7..93245fa 100644
+--- a/tests/test_actuator_integration.py
++++ b/tests/test_actuator_integration.py
+@@ -10,11 +10,14 @@ for _mod in (
+     "homeassistant",
+     "homeassistant.core",
+     "homeassistant.config_entries",
++    "homeassistant.const",
+     "homeassistant.helpers",
+     "homeassistant.helpers.event",
+ ):
+     sys.modules.setdefault(_mod, MagicMock())
+ 
++sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
++
+ import custom_components.shower_guard as shower_guard
+ from custom_components.shower_guard.const import DOMAIN
+ 
+@@ -34,8 +37,16 @@ class FakeServices:
+         )
+ 
+ 
++class FakeStates:
++    def __init__(self):
++        self.calls = []
++
++    def async_set(self, entity_id, new_state, attributes=None):
++        self.calls.append({"entity_id": entity_id, "state": new_state, "attributes": attributes or {}})
++
++
+ def make_hass():
+-    return SimpleNamespace(data={}, services=FakeServices())
++    return SimpleNamespace(data={}, services=FakeServices(), states=FakeStates())
+ 
+ 
+ def patch_track_state_change(monkeypatch_target=shower_guard):
+diff --git a/tests/test_decision.py b/tests/test_decision.py
+index a1e3620..65f9f5b 100644
+--- a/tests/test_decision.py
++++ b/tests/test_decision.py
+@@ -15,11 +15,14 @@ for _mod in (
+     "homeassistant",
+     "homeassistant.core",
+     "homeassistant.config_entries",
++    "homeassistant.const",
+     "homeassistant.helpers",
+     "homeassistant.helpers.event",
+ ):
+     sys.modules.setdefault(_mod, MagicMock())
+ 
++sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
++
+ from custom_components.shower_guard.decision import Decision, DecisionEngine, DecisionLog
+ from custom_components.shower_guard.session import SessionState
+ 
+diff --git a/tests/test_init.py b/tests/test_init.py
+index 0031f75..26aa1b0 100644
+--- a/tests/test_init.py
++++ b/tests/test_init.py
+@@ -19,11 +19,16 @@ for _mod in (
+     "homeassistant",
+     "homeassistant.core",
+     "homeassistant.config_entries",
++    "homeassistant.const",
+     "homeassistant.helpers",
+     "homeassistant.helpers.event",
+ ):
+     sys.modules.setdefault(_mod, MagicMock())
+ 
++# STATE_UNKNOWN must be a real string (not a MagicMock attribute) since
++# __init__.py compares/formats against it directly.
++sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
++
+ import custom_components.shower_guard as shower_guard
+ from custom_components.shower_guard.const import DOMAIN
+ from custom_components.shower_guard.decision import Decision
+@@ -47,8 +52,26 @@ class FakeServices:
+         )
+ 
+ 
++class FakeStates:
++    """Spy for hass.states.async_set, recording every invocation. Only the
++    most recent state per entity_id is kept, mirroring real HA state
++    storage, plus a full call history for asserting on values over time."""
++
++    def __init__(self):
++        self.calls = []
++        self._current = {}
++
++    def async_set(self, entity_id, new_state, attributes=None):
++        entry = {"entity_id": entity_id, "state": new_state, "attributes": attributes or {}}
++        self.calls.append(entry)
++        self._current[entity_id] = entry
++
++    def get(self, entity_id):
++        return self._current.get(entity_id)
++
++
+ def make_hass():
+-    return SimpleNamespace(data={}, services=FakeServices())
++    return SimpleNamespace(data={}, services=FakeServices(), states=FakeStates())
+ 
+ 
+ def patch_track_state_change(monkeypatch_target=shower_guard):
+@@ -682,6 +705,56 @@ def test_actuator_only_calls_configured_side():
+     ]
+ 
+ 
++# ---------------------------------------------------------------------------
++# Published humidity delta state (v1.2 — dashboard support)
++# ---------------------------------------------------------------------------
++
++def test_humidity_delta_published_on_every_evaluation():
++    """Every evaluation — not just decision changes — publishes the current
++    delta as sensor.shower_guard_humidity_delta."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
++        )
++    )
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
++    asyncio.run(captured["callback"](event))
++    published = hass.states.get("sensor.shower_guard_humidity_delta")
++    assert published["state"] == "0.0"
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="85.0")})
++    asyncio.run(captured["callback"](event))
++    published = hass.states.get("sensor.shower_guard_humidity_delta")
++    assert published["state"] == "10.0"
++    assert published["attributes"]["unit_of_measurement"] == "%"
++    assert published["attributes"]["max_humidity_delta"] == 15.0
++
++
++def test_humidity_delta_published_as_unknown_when_idle():
++    """No active session -> humidity_delta is None -> published as unknown,
++    not 0 or blank, so a dashboard can distinguish 'no session' from
++    'session just started at baseline'."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
++        )
++    )
++
++    # Low humidity -> stays IDLE -> no active_since -> humidity_delta is None.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(captured["callback"](event))
++
++    published = hass.states.get("sensor.shower_guard_humidity_delta")
++    assert published["state"] == "unknown"
++
++
+ # ---------------------------------------------------------------------------
+ # Humidity delta wiring (v1.1 — the sole cutoff trigger besides presence)
+ # ---------------------------------------------------------------------------
+diff --git a/tests/test_replay.py b/tests/test_replay.py
+index 6a4f79b..c945c14 100644
+--- a/tests/test_replay.py
++++ b/tests/test_replay.py
+@@ -17,11 +17,14 @@ for _mod in (
+     "homeassistant",
+     "homeassistant.core",
+     "homeassistant.config_entries",
++    "homeassistant.const",
+     "homeassistant.helpers",
+     "homeassistant.helpers.event",
+ ):
+     sys.modules.setdefault(_mod, MagicMock())
+ 
++sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
++
+ from custom_components.shower_guard.decision import Decision
+ from custom_components.shower_guard.replay import load_readings_from_csv, replay
+ from custom_components.shower_guard.session import SessionEvent, SessionState
+diff --git a/tests/test_scaffold.py b/tests/test_scaffold.py
+index 9a0955d..363f80f 100644
+--- a/tests/test_scaffold.py
++++ b/tests/test_scaffold.py
+@@ -15,11 +15,14 @@ for _mod in (
+     "homeassistant",
+     "homeassistant.core",
+     "homeassistant.config_entries",
++    "homeassistant.const",
+     "homeassistant.helpers",
+     "homeassistant.helpers.event",
+ ):
+     sys.modules.setdefault(_mod, MagicMock())
+ 
++sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
++
+ 
+ def test_const_domain():
+     """DOMAIN must equal 'shower_guard'."""
+diff --git a/tests/test_session.py b/tests/test_session.py
+index 4724678..2e7f2b8 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -14,11 +14,14 @@ for _mod in (
+     "homeassistant",
+     "homeassistant.core",
+     "homeassistant.config_entries",
++    "homeassistant.const",
+     "homeassistant.helpers",
+     "homeassistant.helpers.event",
+ ):
+     sys.modules.setdefault(_mod, MagicMock())
+ 
++sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
++
+ from custom_components.shower_guard.session import (
+     SessionDetector,
+     SessionEvent,

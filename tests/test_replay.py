@@ -17,10 +17,13 @@ for _mod in (
     "homeassistant",
     "homeassistant.core",
     "homeassistant.config_entries",
+    "homeassistant.const",
     "homeassistant.helpers",
     "homeassistant.helpers.event",
 ):
     sys.modules.setdefault(_mod, MagicMock())
+
+sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
 
 from custom_components.shower_guard.decision import Decision
 from custom_components.shower_guard.replay import load_readings_from_csv, replay

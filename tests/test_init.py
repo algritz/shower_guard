@@ -19,10 +19,15 @@ for _mod in (
     "homeassistant",
     "homeassistant.core",
     "homeassistant.config_entries",
+    "homeassistant.const",
     "homeassistant.helpers",
     "homeassistant.helpers.event",
 ):
     sys.modules.setdefault(_mod, MagicMock())
+
+# STATE_UNKNOWN must be a real string (not a MagicMock attribute) since
+# __init__.py compares/formats against it directly.
+sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
 
 import custom_components.shower_guard as shower_guard
 from custom_components.shower_guard.const import DOMAIN
@@ -47,8 +52,26 @@ class FakeServices:
         )
 
 
+class FakeStates:
+    """Spy for hass.states.async_set, recording every invocation. Only the
+    most recent state per entity_id is kept, mirroring real HA state
+    storage, plus a full call history for asserting on values over time."""
+
+    def __init__(self):
+        self.calls = []
+        self._current = {}
+
+    def async_set(self, entity_id, new_state, attributes=None):
+        entry = {"entity_id": entity_id, "state": new_state, "attributes": attributes or {}}
+        self.calls.append(entry)
+        self._current[entity_id] = entry
+
+    def get(self, entity_id):
+        return self._current.get(entity_id)
+
+
 def make_hass():
-    return SimpleNamespace(data={}, services=FakeServices())
+    return SimpleNamespace(data={}, services=FakeServices(), states=FakeStates())
 
 
 def patch_track_state_change(monkeypatch_target=shower_guard):
@@ -680,6 +703,56 @@ def test_actuator_only_calls_configured_side():
             "blocking": False,
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# Published humidity delta state (v1.2 — dashboard support)
+# ---------------------------------------------------------------------------
+
+def test_humidity_delta_published_on_every_evaluation():
+    """Every evaluation — not just decision changes — publishes the current
+    delta as sensor.shower_guard_humidity_delta."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+    asyncio.run(captured["callback"](event))
+    published = hass.states.get("sensor.shower_guard_humidity_delta")
+    assert published["state"] == "0.0"
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="85.0")})
+    asyncio.run(captured["callback"](event))
+    published = hass.states.get("sensor.shower_guard_humidity_delta")
+    assert published["state"] == "10.0"
+    assert published["attributes"]["unit_of_measurement"] == "%"
+    assert published["attributes"]["max_humidity_delta"] == 15.0
+
+
+def test_humidity_delta_published_as_unknown_when_idle():
+    """No active session -> humidity_delta is None -> published as unknown,
+    not 0 or blank, so a dashboard can distinguish 'no session' from
+    'session just started at baseline'."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    # Low humidity -> stays IDLE -> no active_since -> humidity_delta is None.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
+
+    published = hass.states.get("sensor.shower_guard_humidity_delta")
+    assert published["state"] == "unknown"
 
 
 # ---------------------------------------------------------------------------

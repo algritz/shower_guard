@@ -15,6 +15,7 @@
 import logging
 from datetime import datetime
 
+from homeassistant.const import STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.event import async_track_state_change_event
@@ -36,6 +37,7 @@ from .const import (
     DEFAULT_MAX_HUMIDITY_DELTA,
     DEFAULT_MAX_SESSION_SECONDS,
     DOMAIN,
+    ENTITY_ID_HUMIDITY_DELTA,
     VERSION,
 )
 from .decision import Decision, DecisionEngine, DecisionLog
@@ -162,11 +164,31 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     notify_service,
                 )
 
+    def _publish_humidity_delta(result) -> None:
+        """Publish the Decision Engine's current humidity delta as a plain HA
+        state, on every evaluation (not just decision changes) — so a
+        dashboard can show live progress toward max_humidity_delta. This is
+        the only place that computes/exposes the delta; nothing else should
+        recompute it (see ADR-0001 — baseline tracking, including the reset
+        on RESUMED, belongs solely to session.py/decision.py)."""
+        delta = result.humidity_delta
+        hass.states.async_set(
+            ENTITY_ID_HUMIDITY_DELTA,
+            f"{delta:.1f}" if delta is not None else STATE_UNKNOWN,
+            {
+                "unit_of_measurement": "%",
+                "friendly_name": "Shower Guard Humidity Delta",
+                "icon": "mdi:delta",
+                "max_humidity_delta": engine.max_humidity_delta,
+            },
+        )
+
     async def _evaluate_and_record(now: datetime) -> None:
-        """Evaluate the Decision Engine, record the result, and — on a
-        decision change — call the configured actuator script. Shared by the
-        humidity and presence callbacks so a presence change alone can
-        trigger a re-evaluation and actuation."""
+        """Evaluate the Decision Engine, record the result, publish the
+        current humidity delta, and — on a decision change — call the
+        configured actuator script. Shared by the humidity and presence
+        callbacks so a presence change alone can trigger a re-evaluation and
+        actuation."""
         result = engine.evaluate(
             detector.state,
             detector.active_since,
@@ -176,6 +198,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             presence=hass.data[DOMAIN]["presence"],
         )
         decision_log.record(result)
+        _publish_humidity_delta(result)
         previous = hass.data[DOMAIN]["last_decision"]
         hass.data[DOMAIN]["last_decision"] = result
         if previous is None or result.decision != previous.decision:

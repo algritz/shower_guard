@@ -10,10 +10,13 @@ for _mod in (
     "homeassistant",
     "homeassistant.core",
     "homeassistant.config_entries",
+    "homeassistant.const",
     "homeassistant.helpers",
     "homeassistant.helpers.event",
 ):
     sys.modules.setdefault(_mod, MagicMock())
+
+sys.modules["homeassistant.const"].STATE_UNKNOWN = "unknown"
 
 import custom_components.shower_guard as shower_guard
 from custom_components.shower_guard.const import DOMAIN
@@ -34,8 +37,16 @@ class FakeServices:
         )
 
 
+class FakeStates:
+    def __init__(self):
+        self.calls = []
+
+    def async_set(self, entity_id, new_state, attributes=None):
+        self.calls.append({"entity_id": entity_id, "state": new_state, "attributes": attributes or {}})
+
+
 def make_hass():
-    return SimpleNamespace(data={}, services=FakeServices())
+    return SimpleNamespace(data={}, services=FakeServices(), states=FakeStates())
 
 
 def patch_track_state_change(monkeypatch_target=shower_guard):

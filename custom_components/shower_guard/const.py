@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 1.1.0
+# version: 1.2.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Session Detection
 # Humidity level (% RH) that triggers session start.
@@ -56,3 +56,11 @@ CONF_WATER_AVAILABLE_SCRIPT = "water_available_script"
 # Optional mobile notification on water cut (ADR-0002).
 # Must be a Home Assistant notify service name, e.g. mobile_app_your_phone.
 CONF_NOTIFY_SERVICE = "notify_service"
+
+# Live decision output, published as a plain HA state (see __init__.py's
+# _publish_humidity_delta) — not an entity platform, consistent with this
+# integration's lightweight, config-flow-free style. Exists so dashboards can
+# show progress toward max_humidity_delta without duplicating the baseline
+# tracking (start-of-session reading, reset on RESUMED) that only
+# session.py/decision.py may own, per ADR-0001.
+ENTITY_ID_HUMIDITY_DELTA = f"sensor.{DOMAIN}_humidity_delta"
