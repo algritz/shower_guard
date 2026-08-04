@@ -23,13 +23,11 @@ scheduled.
   `__init__.py` for this future use.
 
 ### Replay Engine — Presence Support
-- **Reason deferred:** v0.6 added presence as an optional input to
-  `DecisionEngine.evaluate()`, but `replay.py` still only replays
-  `(timestamp, humidity)` readings, to avoid changing its shipped signature.
-- **Target version:** Unscheduled — pick up if replaying presence-driven
-  scenarios becomes necessary for validation.
-- **Notes:** Would require a parallel presence-readings sequence (or a merged
-  reading type) fed into `DecisionEngine.evaluate(..., presence=...)`.
+- **Status:** Implemented in v1.4.0 (ADR-0003). `replay()` now accepts an
+  optional `presence_readings` sequence and confirms delta-triggered cuts
+  the same way production wiring does — this stopped being a nice-to-have
+  once presence became required to confirm any delta-based cutoff. Kept
+  here as a record of the original gap.
 
 ---
 

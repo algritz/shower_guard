@@ -70,7 +70,9 @@ def callback_for(captured, entity_id):
 
 
 def test_actuator_called_on_replay_spike():
-    """Set up the integration, replay the humidity spike, assert script call."""
+    """Set up the integration, confirm presence, replay the humidity spike,
+    assert script call. Presence confirmation is required as of ADR-0003 —
+    without it this same humidity spike would never cut."""
     hass = make_hass()
     captured = patch_track_state_change()
 
@@ -91,6 +93,11 @@ def test_actuator_called_on_replay_spike():
     )
 
     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+
+    # Someone's confirmed in the bathroom for the whole sequence below.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
+    asyncio.run(presence_callback(event))
 
     # Feed the sequence that starts at ~75.6 and rises to >90
     readings = [
@@ -118,7 +125,8 @@ def test_actuator_called_on_replay_spike():
 
 
 def test_actuator_calls_restore_after_humidity_falls():
-    """Simulate a cut followed by humidity falling back below delta and assert restore script called."""
+    """Simulate a cut (with presence confirmed) followed by humidity falling
+    back below delta, and assert restore script called."""
     hass = make_hass()
     captured = patch_track_state_change()
 
@@ -138,6 +146,10 @@ def test_actuator_calls_restore_after_humidity_falls():
     )
 
     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
+    asyncio.run(presence_callback(event))
 
     # Trigger cut: rapid rise
     for h in [75.6, 82.63, 87.03, 91.83]:

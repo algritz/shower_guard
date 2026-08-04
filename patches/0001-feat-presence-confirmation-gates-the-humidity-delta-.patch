@@ -1,0 +1,1714 @@
+From e687f2ae1a9760d67516284ab7e030928fdc505a Mon Sep 17 00:00:00 2001
+From: "Claude (draft)" <assistant@example.com>
+Date: Tue, 4 Aug 2026 10:37:09 +0000
+Subject: [PATCH] feat: presence confirmation gates the humidity-delta cutoff
+ (ADR-0003)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces the old 'presence absent cuts immediately' policy with a
+confirmation-gate model: water is cut only when max_humidity_delta is
+exceeded AND presence has been detected within
+presence_confirmation_window_seconds (default 60s). Delta alone no
+longer cuts water; presence absence alone no longer cuts water.
+
+Rationale: the actuator is a supply valve, not the showerhead itself —
+presence going absent doesn't mean water is being wasted, and delta
+alone risks false cuts from non-shower humidity sources. The
+confirmation window tolerates brief mmWave presence-sensor dropouts
+mid-shower instead of requiring continuous detection.
+
+Also:
+- Decouples max_session_seconds from presence_sensor's mere presence.
+  Off by default unless explicitly configured, independent of presence.
+- Adds presence support to replay.py (closes a previously-deferred
+  BACKLOG item) — without it, replay could no longer exercise the
+  primary cutoff path at all.
+- Adds ADR-0003 documenting the full rationale and consequences.
+- Rewrites all presence/delta tests across test_decision.py,
+  test_init.py, test_actuator_integration.py, and test_replay.py to
+  match the new semantics (97/97 passing).
+
+Bumps version to 1.4.0.
+
+BREAKING: deployments relying on delta-alone cuts with no
+presence_sensor configured will need max_session_seconds as their
+cutoff mechanism now, since delta can never confirm without presence
+data.
+---
+ BACKLOG.md                                   |  12 +-
+ README.md                                    |  86 +++---
+ adr/ADR-0003-presence-confirmation-gate.md   | 114 ++++++++
+ custom_components/shower_guard/__init__.py   |  43 +--
+ custom_components/shower_guard/const.py      |  31 ++-
+ custom_components/shower_guard/decision.py   | 109 +++++---
+ custom_components/shower_guard/manifest.json |   2 +-
+ custom_components/shower_guard/replay.py     |  90 ++++++-
+ tests/test_actuator_integration.py           |  16 +-
+ tests/test_decision.py                       | 270 +++++++++++--------
+ tests/test_init.py                           | 159 +++++++++--
+ tests/test_replay.py                         |  36 ++-
+ 12 files changed, 701 insertions(+), 267 deletions(-)
+ create mode 100644 adr/ADR-0003-presence-confirmation-gate.md
+
+diff --git a/BACKLOG.md b/BACKLOG.md
+index 7828953..b44ac1f 100644
+--- a/BACKLOG.md
++++ b/BACKLOG.md
+@@ -23,13 +23,11 @@ scheduled.
+   `__init__.py` for this future use.
+ 
+ ### Replay Engine — Presence Support
+-- **Reason deferred:** v0.6 added presence as an optional input to
+-  `DecisionEngine.evaluate()`, but `replay.py` still only replays
+-  `(timestamp, humidity)` readings, to avoid changing its shipped signature.
+-- **Target version:** Unscheduled — pick up if replaying presence-driven
+-  scenarios becomes necessary for validation.
+-- **Notes:** Would require a parallel presence-readings sequence (or a merged
+-  reading type) fed into `DecisionEngine.evaluate(..., presence=...)`.
++- **Status:** Implemented in v1.4.0 (ADR-0003). `replay()` now accepts an
++  optional `presence_readings` sequence and confirms delta-triggered cuts
++  the same way production wiring does — this stopped being a nice-to-have
++  once presence became required to confirm any delta-based cutoff. Kept
++  here as a record of the original gap.
+ 
+ ---
+ 
+diff --git a/README.md b/README.md
+index 0dae159..e31fa31 100644
+--- a/README.md
++++ b/README.md
+@@ -28,6 +28,9 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ | v0.6    | Presence Sensor     | ✅ Done     |
+ | v1.0    | Real Actuator       | ✅ Done     |
+ | v1.1    | Humidity-Delta Cutoff | ✅ Done   |
++| v1.2    | Live Humidity Delta Entity | ✅ Done |
++| v1.3    | Live Baseline Humidity Entity | ✅ Done |
++| v1.4    | Presence Confirmation Gate (ADR-0003) | ✅ Done |
+ 
+ ## Installation
+ 
+@@ -35,7 +38,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ 2. Restart Home Assistant.
+ 3. Configure via `configuration.yaml` (see below).
+ 
+-## Configuration (v1.1)
++## Configuration (v1.4)
+ 
+ ```yaml
+ shower_guard:
+@@ -44,7 +47,8 @@ shower_guard:
+   humidity_threshold: 75.0                            # optional — default 75.0
+   cooldown_seconds: 300                               # optional — default 300 (5 min)
+   max_humidity_delta: 15.0                             # optional — default 15.0 (percentage points RH)
+-  max_session_seconds: 900                             # optional — default 900 (15 min); ignored if presence_sensor is set
++  presence_confirmation_window_seconds: 60             # optional — default 60s (see ADR-0003)
++  max_session_seconds: 900                             # optional — off by default; independent of presence_sensor
+   decision_log_size: 100                               # optional — default 100 entries
+   water_cut_script: script.cut_water                   # optional — called when water is cut
+   water_available_script: script.restore_water         # optional — called when water is restored
+@@ -59,35 +63,41 @@ Home Assistant log. On every decision **change**, the corresponding HA script
+ `script.turn_on` service, per ADR-0001 (actuator abstraction via scripts only;
+ the Decision Engine itself never references a script or device).
+ 
+-**Humidity-delta cutoff (v1.1):** water is cut once humidity has risen
+-`max_humidity_delta` percentage points above the current baseline — not
+-after a fixed duration. A hot shower generates steam quickly and gets capped
+-sooner; a cold shower (little humidity rise) is not penalized just for
+-running long. The baseline is the reading at session start, and **resets on
+-each `RESUMED` event** (humidity rising again during the `cooldown_seconds`
+-window) so a sibling starting a fresh shower right after the first gets their
+-own baseline instead of inheriting the previous person's cumulative rise.
+-
+-**Duration fallback (optional):** `max_session_seconds` (default 900s / 15
+-min) is only wired in when **no `presence_sensor` is configured**. With a
+-presence sensor, an unattended session is already caught precisely by
+-presence absence, and a duration cap would reintroduce the "cold shower"
+-stiffness the delta policy was designed to avoid — so it's disabled
+-automatically in that case. Without a presence sensor, it's the safety net
+-for a session whose humidity never rises enough to trip the delta policy.
++**Humidity-delta cutoff (v1.1, gated by presence as of v1.4 — see ADR-0003):**
++water is cut once humidity has risen `max_humidity_delta` percentage points
++above the current baseline **and** presence has been confirmed within
++`presence_confirmation_window_seconds` — not on delta alone. The baseline is
++the reading at session start, and **resets on each `RESUMED` event**
++(humidity rising again during the `cooldown_seconds` window) so a sibling
++starting a fresh shower right after the first gets their own baseline
++instead of inheriting the previous person's cumulative rise. Without a
++`presence_sensor` configured at all, delta alone never cuts water — see
++Presence Sensor below.
++
++**Duration fallback (optional, independent of presence — ADR-0003):**
++`max_session_seconds` is off unless explicitly configured, regardless of
++whether `presence_sensor` is set. It's the safety net for a session that
++never gets a delta+presence match — no presence sensor, a cold shower that
++never trips the delta, or a delta that trips but is never presence-confirmed.
+ 
+ **Actuator (v1.0):** either script may be omitted independently. If a script
+ for a given decision isn't configured, that side stays dry run (computed and
+ logged only) while the other side can still actuate. A failed script call is
+ caught and logged — it never crashes session tracking.
+ 
+-**Presence Sensor (v0.6, optional):** when `presence_sensor` is configured, an
+-active session with no presence detected (`'off'`) cuts water **immediately**
+-— taking priority over the humidity-delta policy — modeling an unattended
+-running shower. Presence changes are evaluated as soon as they're reported,
+-without waiting for the next humidity reading. If `presence_sensor` is not
+-configured, or its state is `unknown`/`unavailable`, behavior falls back to
+-the humidity-delta policy (plus the duration fallback if configured).
++**Presence Sensor (v0.6; behavior changed in v1.4 — see ADR-0003):** when
++`presence_sensor` is configured, presence acts as a **confirmation gate** on
++the humidity-delta cutoff, not an independent trigger. Water is cut only when
++delta exceeds `max_humidity_delta` **and** presence has been detected within
++the last `presence_confirmation_window_seconds` (default 60s) — either
++presence is `True` right now, or it was last seen `True` within that window.
++This tolerates brief presence-sensor dropouts (e.g. mmWave flapping) mid-shower
++without either causing a false cutoff or missing a real one. Presence going
++absent on its own no longer cuts water immediately — that policy was removed
++in v1.4 as the wrong model for a supply-valve actuator (see ADR-0003 for the
++full rationale). If `presence_sensor` is not configured, or its state is
++`unknown`/`unavailable`, the delta policy never confirms — configure
++`max_session_seconds` as a fallback in that case.
+ 
+ **Decision Logging (v0.4):** every Decision Engine evaluation — not just
+ changes — is recorded into a bounded, in-memory `DecisionLog`
+@@ -95,29 +105,37 @@ changes — is recorded into a bounded, in-memory `DecisionLog`
+ audit trail for troubleshooting and a foundation the Replay Engine (v0.5) can
+ build on.
+ 
+-## Replay Engine (v0.5)
++## Replay Engine (v0.5; presence support added v1.4 — ADR-0003)
+ 
+-Replay recorded or synthetic humidity readings through the **exact same**
+-`SessionDetector` and `DecisionEngine` classes used in production — no
+-decision logic is duplicated. Useful for validating threshold/delta tuning
+-against historical data, entirely outside Home Assistant.
++Replay recorded or synthetic humidity (and optionally presence) readings
++through the **exact same** `SessionDetector` and `DecisionEngine` classes
++used in production — no decision logic is duplicated. Useful for validating
++threshold/delta/presence-window tuning against historical data, entirely
++outside Home Assistant.
+ 
+ ```bash
+ python -m custom_components.shower_guard.replay readings.csv \
++  --presence-csv presence.csv \
+   --humidity-threshold 75.0 \
+   --cooldown-seconds 300 \
+   --max-humidity-delta 15.0 \
++  --presence-confirmation-window-seconds 60 \
+   --max-session-seconds 900
+ ```
+ 
+-`readings.csv` must have `timestamp` (ISO 8601) and `humidity` columns. From
+-Python:
++`readings.csv` must have `timestamp` (ISO 8601) and `humidity` columns.
++`presence.csv` (optional — since v1.4, per ADR-0003, delta-triggered cuts
++won't confirm without it) must have `timestamp` and `presence` columns
++(`on`/`off` or `true`/`false`). From Python:
+ 
+ ```python
+-from custom_components.shower_guard.replay import replay, load_readings_from_csv
++from custom_components.shower_guard.replay import (
++    replay, load_readings_from_csv, load_presence_readings_from_csv,
++)
+ 
+ readings = load_readings_from_csv("readings.csv")
+-result = replay(readings)
++presence_readings = load_presence_readings_from_csv("presence.csv")
++result = replay(readings, presence_readings=presence_readings)
+ 
+ result.state_changes   # list[StateChange]
+ result.decision_log     # DecisionLog — same object used by the live integration
+diff --git a/adr/ADR-0003-presence-confirmation-gate.md b/adr/ADR-0003-presence-confirmation-gate.md
+new file mode 100644
+index 0000000..c330e36
+--- /dev/null
++++ b/adr/ADR-0003-presence-confirmation-gate.md
+@@ -0,0 +1,114 @@
++# ADR-0003 — Presence as a Confirmation Gate, Not an Independent Trigger
++
++| Field     | Value                    |
++|-----------|--------------------------|
++| Status    | Accepted                 |
++| Date      | 2026-08-05               |
++| Author    | Technical Lead           |
++
++---
++
++## Context
++
++The v0.6 presence policy cut water immediately whenever `presence=False` was
++reported during an active session, modeling an "unattended running shower."
++In practice this had two problems:
++
++1. **Wrong actuator model.** The actuator here is a water supply valve/pump,
++   not the showerhead. If someone finishes and physically turns off the
++   shower, water has already stopped — presence going absent doesn't mean
++   water is being wasted, it just means the room is empty while residual
++   humidity decays. Cutting the house's water supply in that moment achieves
++   nothing and can inconvenience anyone else who wants water elsewhere.
++2. **False positives from delta alone.** Independently, `max_humidity_delta`
++   being exceeded cut water regardless of presence. A stray humidity rise
++   from another cause (weather, another steam source, a miscalibrated
++   sensor) could trigger a cutoff with nobody in the bathroom at all.
++3. **mmWave presence flapping.** The bathroom's mmWave sensor toggles on/off
++   frequently even during genuine occupancy (observed ~60s on-bursts,
++   ~285s off-gaps). A policy requiring continuous `presence=True` at the
++   exact instant of evaluation would itself cause false cutoffs mid-shower.
++
++## Decision
++
++Presence becomes a **confirmation gate** on the humidity-delta cutoff,
++rather than either substituting for it or triggering independently:
++
++> Water is cut only when `humidity_delta >= max_humidity_delta` **and**
++> presence has been detected within `presence_confirmation_window_seconds`
++> (default 60s) of the evaluation — either `presence` is `True` right now,
++> or it was last seen `True` at `last_presence_at` within the window.
++
++This directly resolves problem 3: a brief mmWave dropout within the window
++still counts as confirmed, so flapping doesn't defeat a real cutoff or
++cause one prematurely.
++
++The old "presence absent cuts immediately" policy is removed outright — it
++is not folded into any new mechanism. If a household wants an unattended-
++session safety net independent of humidity, `max_session_seconds` (see
++below) is the tool for that, not presence.
++
++### Duration fallback decoupled from presence_sensor
++
++Previously, configuring `presence_sensor` at all forced `max_session_seconds`
++to `None` (disabled), on the theory that presence already caught unattended
++sessions precisely. That coupling no longer makes sense — presence is now a
++gate, not a trigger, so its mere configuration says nothing about whether a
++duration safety net is wanted. `max_session_seconds` is now off unless
++explicitly configured, independent of `presence_sensor`.
++
++### What changes
++
++| File           | Change                                                                 |
++|----------------|-------------------------------------------------------------------------|
++| `decision.py`  | Remove the `presence is False` immediate-cut branch. Delta-exceeded now requires `presence_confirmed` (computed from `presence` and `last_presence_at`) to cut; if not confirmed, falls through to the duration fallback check instead of returning early. New `presence_confirmation_window_seconds` engine parameter. `evaluate()` gains `last_presence_at: Optional[datetime]`. |
++| `const.py`     | Add `CONF_PRESENCE_CONFIRMATION_WINDOW_SECONDS` / `DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS` (60.0). Duration fallback default changes from "900s if no presence_sensor" to "off unless explicitly set." |
++| `__init__.py`  | Track `last_presence_at` in `hass.data[DOMAIN]`, updated whenever the presence callback observes `True`. Pass it through to `engine.evaluate()`. `max_session_seconds` no longer conditioned on `presence_sensor`. |
++| `replay.py`    | New optional `presence_readings` parameter and `load_presence_readings_from_csv()`, since replay must mirror production evaluation — without presence data, replay could no longer exercise the primary cutoff path at all. Closes the previously-deferred BACKLOG item. |
++| Tests          | All presence-absence-cuts and delta-alone-cuts tests rewritten around the new gate semantics, across `test_decision.py`, `test_init.py`, `test_actuator_integration.py`, `test_replay.py`. |
++
++### Configuration
++
++```yaml
++shower_guard:
++  humidity_sensor: sensor.bathroom_third_reality_inc_3rths0224z_humidity
++  presence_sensor: binary_sensor.movement_detector_bathroom
++  max_humidity_delta: 15.0
++  presence_confirmation_window_seconds: 60   # optional, default shown
++  max_session_seconds: 900                   # optional, independent safety net
++```
++
++## Consequences
++
++- **Without a presence sensor configured, delta alone never cuts water.**
++  `presence` and `last_presence_at` are always `None` in that case, so
++  `presence_confirmed` is always `False`. A deployment relying solely on
++  `max_humidity_delta` with no presence sensor now needs `max_session_seconds`
++  as its only cutoff mechanism — this is a real behavior change for any such
++  deployment, not just Shower Guard's own instance.
++- Brief presence-sensor dropouts (mmWave flapping) during a real shower no
++  longer cause a spurious "not confirmed" result, as long as the last `True`
++  reading is within the confirmation window.
++- The duration fallback is now a genuinely independent, presence-agnostic
++  safety net, which also makes its behavior easier to reason about — it no
++  longer silently changes based on whether an unrelated sensor is configured.
++- `replay()`'s signature grows (backward compatible — new parameters are
++  optional with matching defaults), but any existing caller relying on
++  delta-alone cuts in a replay will see decisions change from `WATER_CUT` to
++  `WATER_AVAILABLE` unless `presence_readings` is supplied.
++
++## Alternatives Considered
++
++- **Keep presence-absence-cuts, just make it optional/configurable** —
++  Rejected. The underlying actuator-model problem (cutting a supply valve
++  doesn't stop water that's already off) doesn't go away by making the
++  behavior opt-in; it's simply the wrong model for this actuator.
++- **Instantaneous presence check (no confirmation window)** — Rejected.
++  Directly reproduces the mmWave-flapping false-cutoff risk this ADR exists
++  to avoid.
++- **Track presence recency in the wiring layer instead of the Decision
++  Engine** — Rejected. `last_presence_at` is state, but the *decision* of
++  whether it's still "confirmed" given `now` is decision logic and belongs
++  in `decision.py`, consistent with ADR-0001 keeping the Decision Engine as
++  the sole owner of cutoff policy. The wiring layer only tracks and passes
++  through the raw timestamp.
+diff --git a/custom_components/shower_guard/__init__.py b/custom_components/shower_guard/__init__.py
+index 546d694..ca5ab67 100644
+--- a/custom_components/shower_guard/__init__.py
++++ b/custom_components/shower_guard/__init__.py
+@@ -1,15 +1,19 @@
+ # ---
+ # purpose: Home Assistant integration entry point for Shower Guard.
+-# version: 1.1.0
++# version: 1.4.0
+ # note: Wires the Sensor Layer (humidity entity, optional presence entity)
+ #       into Session Detection and the Decision Engine, records every
+ #       decision into a bounded DecisionLog, and — when configured — calls
+ #       the actuator (an HA script) on a decision change. The Decision
+ #       Engine itself never references an actuator; only this wiring layer
+ #       does (see ADR-0001). Omitting the actuator scripts keeps that side
+-#       of the decision dry run (computed and logged only). The optional
+-#       duration fallback (max_session_seconds) is only enabled when no
+-#       presence_sensor is configured.
++#       of the decision dry run (computed and logged only). Presence, when
++#       configured, gates the humidity-delta cutoff rather than triggering
++#       independently (see ADR-0003) — this wiring tracks the last time
++#       presence was seen True so brief mmWave dropouts within the
++#       confirmation window don't defeat a real cutoff. The optional
++#       duration fallback (max_session_seconds) is independent of presence
++#       and disabled unless explicitly configured.
+ # ---
+ 
+ import logging
+@@ -28,6 +32,7 @@ from .const import (
+     CONF_MAX_HUMIDITY_DELTA,
+     CONF_MAX_SESSION_SECONDS,
+     CONF_NOTIFY_SERVICE,
++    CONF_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+     CONF_PRESENCE_SENSOR,
+     CONF_WATER_AVAILABLE_SCRIPT,
+     CONF_WATER_CUT_SCRIPT,
+@@ -36,6 +41,7 @@ from .const import (
+     DEFAULT_HUMIDITY_THRESHOLD,
+     DEFAULT_MAX_HUMIDITY_DELTA,
+     DEFAULT_MAX_SESSION_SECONDS,
++    DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+     DOMAIN,
+     ENTITY_ID_HUMIDITY_DELTA,
+     ENTITY_ID_SESSION_BASELINE_HUMIDITY,
+@@ -85,18 +91,18 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+ 
+     presence_sensor = domain_config.get(CONF_PRESENCE_SENSOR)
+ 
+-    # Duration fallback only applies when there's no presence sensor to catch
+-    # an unattended session precisely — with one configured, the delta policy
+-    # plus presence is sufficient and a duration cap would reintroduce the
+-    # "cold shower" stiffness this policy was designed to avoid.
++    # Duration fallback is independent of presence now (see ADR-0003):
++    # presence confirms a delta-based cut rather than substituting for one,
++    # so it no longer implies the fallback should be disabled. Off unless
++    # explicitly configured, regardless of presence_sensor.
+     engine = DecisionEngine(
+         max_humidity_delta=domain_config.get(
+             CONF_MAX_HUMIDITY_DELTA, DEFAULT_MAX_HUMIDITY_DELTA
+         ),
+-        max_session_seconds=(
+-            None
+-            if presence_sensor
+-            else domain_config.get(CONF_MAX_SESSION_SECONDS, DEFAULT_MAX_SESSION_SECONDS)
++        max_session_seconds=domain_config.get(CONF_MAX_SESSION_SECONDS, None),
++        presence_confirmation_window_seconds=domain_config.get(
++            CONF_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
++            DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+         ),
+     )
+     decision_log = DecisionLog(
+@@ -109,6 +115,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+     hass.data[DOMAIN]["decision_log"] = decision_log
+     hass.data[DOMAIN]["last_decision"] = None
+     hass.data[DOMAIN]["presence"] = None  # None = no presence sensor / unknown
++    hass.data[DOMAIN]["last_presence_at"] = None  # last time presence was True
+     hass.data[DOMAIN]["last_humidity"] = None  # None = no humidity reading yet
+ 
+     water_cut_script = domain_config.get(CONF_WATER_CUT_SCRIPT)
+@@ -208,6 +215,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+             humidity=hass.data[DOMAIN]["last_humidity"],
+             active_since_humidity=detector.active_since_humidity,
+             presence=hass.data[DOMAIN]["presence"],
++            last_presence_at=hass.data[DOMAIN]["last_presence_at"],
+         )
+         decision_log.record(result)
+         _publish_decision_state(result, detector.active_since_humidity)
+@@ -251,9 +259,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+     if presence_sensor:
+ 
+         async def _handle_presence_change(event) -> None:
+-            """Track the latest known presence value and immediately
+-            re-evaluate the Decision Engine — leaving the room during an
+-            active session should cut water without waiting on humidity."""
++            """Track the latest known presence value, and — whenever it's
++            True — the timestamp it was last confirmed, so a delta-triggered
++            cutoff can still fire on the next humidity reading even if
++            presence has since flickered off (see ADR-0003's confirmation
++            window). Also immediately re-evaluates, since presence changing
++            can flip a cutoff decision without waiting on humidity."""
+             new_state = event.data.get("new_state")
+             if new_state is None:
+                 return
+@@ -263,6 +274,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+                 return
+ 
+             hass.data[DOMAIN]["presence"] = presence
++            if presence is True:
++                hass.data[DOMAIN]["last_presence_at"] = datetime.now()
+             await _evaluate_and_record(datetime.now())
+ 
+         hass.data[DOMAIN]["remove_presence_listener"] = (
+diff --git a/custom_components/shower_guard/const.py b/custom_components/shower_guard/const.py
+index 8e87f65..ee00820 100644
+--- a/custom_components/shower_guard/const.py
++++ b/custom_components/shower_guard/const.py
+@@ -1,11 +1,11 @@
+ # ---
+ # purpose: Central constants for the Shower Guard integration.
+-# version: 1.3.0
++# version: 1.4.0
+ # note: Add new constants here. Never scatter magic strings across modules.
+ # ---
+ 
+ DOMAIN = "shower_guard"
+-VERSION = "1.3.0"
++VERSION = "1.4.0"
+ 
+ # Session Detection
+ # Humidity level (% RH) that triggers session start.
+@@ -28,10 +28,12 @@ CONF_COOLDOWN_SECONDS = "cooldown_seconds"
+ DEFAULT_MAX_HUMIDITY_DELTA: float = 15.0
+ CONF_MAX_HUMIDITY_DELTA = "max_humidity_delta"
+ 
+-# Optional duration-based fallback (see ADR-0001). Only wired in when no
+-# presence_sensor is configured — with a presence sensor, an unattended
+-# session is already caught precisely; without one, this is the safety net
+-# for a session whose humidity never rises enough to trip the delta policy.
++# Optional duration-based fallback (see ADR-0001, ADR-0003). Disabled unless
++# explicitly configured — independent of whether a presence sensor is set,
++# since presence confirmation now gates the delta cutoff (see ADR-0003)
++# rather than substituting for a duration safety net. This remains the
++# fallback for a session whose humidity never rises enough to trip the delta
++# policy, or that never gets a presence confirmation.
+ DEFAULT_MAX_SESSION_SECONDS: float = 900.0  # 15 minutes
+ CONF_MAX_SESSION_SECONDS = "max_session_seconds"
+ 
+@@ -40,11 +42,22 @@ CONF_MAX_SESSION_SECONDS = "max_session_seconds"
+ DEFAULT_DECISION_LOG_SIZE: int = 100
+ CONF_DECISION_LOG_SIZE = "decision_log_size"
+ 
+-# Presence Sensor (optional Sensor Layer input, see ADR-0001)
+-# When configured, an active session with no presence detected cuts water
+-# immediately, regardless of humidity delta.
++# Presence Sensor (optional Sensor Layer input, see ADR-0001, ADR-0003)
++# When configured, presence acts as a *confirmation gate* on the humidity
++# delta cutoff (policy 3), not an independent trigger: water is only cut once
++# delta exceeds max_humidity_delta AND presence has been detected within the
++# last presence_confirmation_window_seconds. Without a presence sensor
++# configured, delta alone never cuts water — configure max_session_seconds
++# as a fallback in that case.
+ CONF_PRESENCE_SENSOR = "presence_sensor"
+ 
++# How recently presence must have been detected (seconds) for it to count as
++# "confirmed" toward the delta cutoff gate above. A window rather than an
++# instantaneous check tolerates brief mmWave dropouts mid-shower without
++# treating them as absence.
++DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS: float = 60.0
++CONF_PRESENCE_CONFIRMATION_WINDOW_SECONDS = "presence_confirmation_window_seconds"
++
+ # Actuator (v1.0, see ADR-0001)
+ # HA script entities called on a decision change. The Decision Engine never
+ # references these directly — only the Sensor Layer wiring (__init__.py)
+diff --git a/custom_components/shower_guard/decision.py b/custom_components/shower_guard/decision.py
+index d1c6196..b40aa9b 100644
+--- a/custom_components/shower_guard/decision.py
++++ b/custom_components/shower_guard/decision.py
+@@ -19,7 +19,11 @@ from datetime import datetime
+ from enum import Enum
+ from typing import Optional
+ 
+-from .const import DEFAULT_DECISION_LOG_SIZE, DEFAULT_MAX_HUMIDITY_DELTA
++from .const import (
++    DEFAULT_DECISION_LOG_SIZE,
++    DEFAULT_MAX_HUMIDITY_DELTA,
++    DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
++)
+ from .session import SessionState
+ 
+ 
+@@ -57,28 +61,33 @@ class DecisionEngine:
+     """
+     Decides whether water should remain available.
+ 
+-    Policies (checked in order):
++    Policies (checked in order; see ADR-0003):
+     1. No active session -> water available.
+-    2. Presence configured and explicitly absent (``presence=False``) during
+-       an active session -> cut water immediately (unattended running
+-       shower). Ignored when ``presence`` is ``None`` (no presence sensor
+-       configured, or its state is unknown).
+-    3. Humidity has risen by ``max_humidity_delta`` or more above the current
+-       baseline -> cut water. The baseline is the session-start reading, and
+-       resets on every RESUMED event (see
+-       ``SessionDetector.active_since_humidity``) so a sibling starting a
++    2. Humidity has risen by ``max_humidity_delta`` or more above the current
++       baseline (session-start reading, reset on every RESUMED event — see
++       ``SessionDetector.active_since_humidity`` — so a sibling starting a
+        fresh shower during the cooldown window gets its own baseline rather
+-       than inheriting the previous person's cumulative rise. A hot shower
+-       generates steam quickly and gets capped sooner; a cold shower (little
+-       humidity rise) is not penalized just for running long. Skipped when
+-       ``humidity`` or ``active_since_humidity`` is unavailable.
+-    4. Optional duration fallback: if ``max_session_seconds`` is configured
++       than inheriting the previous person's cumulative rise) AND presence
++       has been confirmed within ``presence_confirmation_window_seconds``
++       (either ``presence`` is ``True`` right now, or it was seen ``True`` at
++       ``last_presence_at`` within the window) -> cut water. Presence is a
++       *confirmation gate*, not an independent trigger: exceeding the delta
++       alone, without a recent presence confirmation, does NOT cut water —
++       this guards against a stray humidity rise (weather, another steam
++       source) being mistaken for an actual unattended shower. Without a
++       presence sensor configured at all, ``presence`` and
++       ``last_presence_at`` are always ``None``, so this policy can never
++       cut — configure ``max_session_seconds`` (policy 3) as a fallback in
++       that case.
++    3. Optional duration fallback: if ``max_session_seconds`` is configured
+        (not ``None``) and the session has run longer than it -> cut water.
+-       Disabled by default. The wiring layer (__init__.py) only enables this
+-       when no presence sensor is configured, since presence already catches
+-       an unattended session precisely — this is the safety net for when it
+-       doesn't exist and humidity never rises enough to trip policy 3.
+-    5. Otherwise -> water available.
++       Disabled by default, and independent of presence — the safety net for
++       a session that never gets a delta+presence match (e.g. no presence
++       sensor, a cold shower that never trips the delta, or a delta that
++       trips but is never presence-confirmed). Checked even when policy 2's
++       delta condition was met but presence wasn't confirmed — that case
++       doesn't return early.
++    4. Otherwise -> water available.
+ 
+     ``evaluate()`` is a pure computation. Callers are responsible for logging
+     or acting on the result — this layer never calls an actuator or HA script
+@@ -89,9 +98,11 @@ class DecisionEngine:
+         self,
+         max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
+         max_session_seconds: Optional[float] = None,
++        presence_confirmation_window_seconds: float = DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+     ) -> None:
+         self.max_humidity_delta = max_humidity_delta
+         self.max_session_seconds = max_session_seconds
++        self.presence_confirmation_window_seconds = presence_confirmation_window_seconds
+ 
+     def evaluate(
+         self,
+@@ -101,6 +112,7 @@ class DecisionEngine:
+         humidity: Optional[float] = None,
+         active_since_humidity: Optional[float] = None,
+         presence: Optional[bool] = None,
++        last_presence_at: Optional[datetime] = None,
+     ) -> DecisionResult:
+         """
+         Evaluate whether water should remain available.
+@@ -120,8 +132,12 @@ class DecisionEngine:
+                                     ``SessionDetector.active_since_humidity``),
+                                     if known.
+             presence:               ``True``/``False`` if a presence sensor is
+-                                    configured and its state is known,
++                                    configured and its current state is known,
+                                     otherwise ``None``.
++            last_presence_at:       Timestamp presence was last seen ``True``,
++                                    or ``None`` if never/no presence sensor.
++                                    Used with ``presence`` to compute the
++                                    confirmation window (see policy 2 above).
+         """
+         if session_state is SessionState.IDLE or active_since is None:
+             return DecisionResult(
+@@ -134,15 +150,6 @@ class DecisionEngine:
+ 
+         duration = (now - active_since).total_seconds()
+ 
+-        if presence is False:
+-            return DecisionResult(
+-                decision=Decision.WATER_CUT,
+-                reason="No presence detected during an active session.",
+-                timestamp=now,
+-                session_state=session_state,
+-                session_duration_seconds=duration,
+-            )
+-
+         delta = (
+             humidity - active_since_humidity
+             if humidity is not None and active_since_humidity is not None
+@@ -150,17 +157,37 @@ class DecisionEngine:
+         )
+ 
+         if delta is not None and delta >= self.max_humidity_delta:
+-            return DecisionResult(
+-                decision=Decision.WATER_CUT,
+-                reason=(
+-                    f"Humidity rose {delta:.1f} points since session start "
+-                    f"(>= {self.max_humidity_delta:.1f})."
+-                ),
+-                timestamp=now,
+-                session_state=session_state,
+-                session_duration_seconds=duration,
+-                humidity_delta=delta,
++            presence_confirmed = presence is True or (
++                last_presence_at is not None
++                and (now - last_presence_at).total_seconds()
++                <= self.presence_confirmation_window_seconds
++            )
++            if presence_confirmed:
++                return DecisionResult(
++                    decision=Decision.WATER_CUT,
++                    reason=(
++                        f"Humidity rose {delta:.1f} points since session start "
++                        f"(>= {self.max_humidity_delta:.1f}) with presence "
++                        f"confirmed within the last "
++                        f"{self.presence_confirmation_window_seconds:.0f}s."
++                    ),
++                    timestamp=now,
++                    session_state=session_state,
++                    session_duration_seconds=duration,
++                    humidity_delta=delta,
++                )
++            # Delta exceeded but not presence-confirmed: this policy alone
++            # won't cut, but doesn't return early either — the duration
++            # fallback below is an independent safety net and still gets a
++            # chance to catch the session.
++            delta_unconfirmed_reason = (
++                f"Humidity rose {delta:.1f} points (>= "
++                f"{self.max_humidity_delta:.1f}) but no presence confirmed "
++                f"within the last "
++                f"{self.presence_confirmation_window_seconds:.0f}s; not cutting."
+             )
++        else:
++            delta_unconfirmed_reason = None
+ 
+         if self.max_session_seconds is not None and duration >= self.max_session_seconds:
+             return DecisionResult(
+@@ -177,7 +204,7 @@ class DecisionEngine:
+ 
+         return DecisionResult(
+             decision=Decision.WATER_AVAILABLE,
+-            reason="Humidity rise within allowed delta.",
++            reason=delta_unconfirmed_reason or "Humidity rise within allowed delta.",
+             timestamp=now,
+             session_state=session_state,
+             session_duration_seconds=duration,
+diff --git a/custom_components/shower_guard/manifest.json b/custom_components/shower_guard/manifest.json
+index e0e7538..ac76efd 100644
+--- a/custom_components/shower_guard/manifest.json
++++ b/custom_components/shower_guard/manifest.json
+@@ -1,7 +1,7 @@
+ {
+ 	"domain": "shower_guard",
+ 	"name": "Shower Guard",
+-	"version": "1.3.0",
++	"version": "1.4.0",
+ 	"documentation": "https://github.com/algritz/shower_guard",
+ 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
+ 	"dependencies": [],
+diff --git a/custom_components/shower_guard/replay.py b/custom_components/shower_guard/replay.py
+index 623fc4b..e74b2aa 100644
+--- a/custom_components/shower_guard/replay.py
++++ b/custom_components/shower_guard/replay.py
+@@ -1,8 +1,9 @@
+ # ---
+-# purpose: Replay Engine — replays historical or synthetic humidity readings
+-#          through the exact same Session Detection and Decision Engine
+-#          classes used in production. No decision logic is duplicated here.
+-# version: 1.1.0
++# purpose: Replay Engine — replays historical or synthetic humidity (and
++#          optionally presence) readings through the exact same Session
++#          Detection and Decision Engine classes used in production. No
++#          decision logic is duplicated here.
++# version: 1.4.0
+ # note:    Pure Python. No Home Assistant imports. Keep lightweight per
+ #          ADR-0001. Runnable standalone:
+ #          `python -m custom_components.shower_guard.replay <csv-file>`.
+@@ -21,11 +22,13 @@ from .const import (
+     DEFAULT_DECISION_LOG_SIZE,
+     DEFAULT_HUMIDITY_THRESHOLD,
+     DEFAULT_MAX_HUMIDITY_DELTA,
++    DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+ )
+ from .decision import DecisionEngine, DecisionLog
+ from .session import SessionDetector, StateChange
+ 
+ Reading = Tuple[datetime, float]
++PresenceReading = Tuple[datetime, bool]
+ 
+ 
+ @dataclass
+@@ -42,6 +45,8 @@ def replay(
+     cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+     max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
+     max_session_seconds: Optional[float] = None,
++    presence_confirmation_window_seconds: float = DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
++    presence_readings: Optional[Iterable[PresenceReading]] = None,
+     decision_log_size: int = DEFAULT_DECISION_LOG_SIZE,
+ ) -> ReplayResult:
+     """
+@@ -50,16 +55,41 @@ def replay(
+     used in production (see ``__init__.py``). This is orchestration only — no
+     session or decision logic is reimplemented here. ``max_session_seconds``
+     mirrors the optional duration fallback (disabled by default, ``None``).
++
++    ``presence_readings``, if given, is an oldest-first sequence of
++    ``(timestamp, presence)`` events mirroring a presence sensor's state
++    changes, advanced in lockstep with ``readings`` so each evaluation sees
++    the current presence and last-confirmed-True timestamp exactly as the
++    live wiring computes them (see ADR-0003). Without it, delta-triggered
++    cuts never confirm — matching production behavior with no
++    ``presence_sensor`` configured. Both sequences must independently be
++    sorted oldest-first; they don't need matching timestamps or lengths.
+     """
+     detector = SessionDetector(
+         humidity_threshold=humidity_threshold, cooldown_seconds=cooldown_seconds
+     )
+     engine = DecisionEngine(
+-        max_humidity_delta=max_humidity_delta, max_session_seconds=max_session_seconds
++        max_humidity_delta=max_humidity_delta,
++        max_session_seconds=max_session_seconds,
++        presence_confirmation_window_seconds=presence_confirmation_window_seconds,
+     )
+     result = ReplayResult(decision_log=DecisionLog(max_entries=decision_log_size))
+ 
++    presence_events = sorted(presence_readings or [], key=lambda r: r[0])
++    presence_idx = 0
++    current_presence: Optional[bool] = None
++    last_presence_at: Optional[datetime] = None
++
+     for now, humidity in readings:
++        # Apply any presence events that occurred at or before this reading,
++        # in order — mirrors the live presence callback updating
++        # last_presence_at only when presence is confirmed True.
++        while presence_idx < len(presence_events) and presence_events[presence_idx][0] <= now:
++            event_time, current_presence = presence_events[presence_idx]
++            if current_presence is True:
++                last_presence_at = event_time
++            presence_idx += 1
++
+         change = detector.update(humidity=humidity, now=now)
+         if change is not None:
+             result.state_changes.append(change)
+@@ -70,6 +100,8 @@ def replay(
+             now,
+             humidity=humidity,
+             active_since_humidity=detector.active_since_humidity,
++            presence=current_presence,
++            last_presence_at=last_presence_at,
+         )
+         result.decision_log.record(decision)
+ 
+@@ -91,15 +123,45 @@ def load_readings_from_csv(path: str) -> List[Reading]:
+     return readings
+ 
+ 
++def load_presence_readings_from_csv(path: str) -> List[PresenceReading]:
++    """
++    Load ``(timestamp, presence)`` readings from a CSV file with
++    ``timestamp`` and ``presence`` columns. ``presence`` must be ``on``/``off``
++    (matching a real presence binary_sensor's states) or ``true``/``false``.
++    """
++    readings: List[PresenceReading] = []
++    with open(path, newline="") as csv_file:
++        for row in csv.DictReader(csv_file):
++            presence_value = row["presence"].strip().lower()
++            if presence_value not in ("on", "off", "true", "false"):
++                raise ValueError(
++                    f"Unrecognized presence value '{row['presence']}' in {path} "
++                    "(expected on/off or true/false)"
++                )
++            readings.append(
++                (
++                    datetime.fromisoformat(row["timestamp"]),
++                    presence_value in ("on", "true"),
++                )
++            )
++    return readings
++
++
+ def _main() -> None:
+     """CLI: replay a CSV file of readings and print the results."""
+     parser = argparse.ArgumentParser(
+         description=(
+-            "Replay recorded humidity readings through Shower Guard's Session "
+-            "Detection and Decision Engine (dry run — no actuator is called)."
++            "Replay recorded humidity (and optionally presence) readings "
++            "through Shower Guard's Session Detection and Decision Engine "
++            "(dry run — no actuator is called)."
+         )
+     )
+     parser.add_argument("csv_file", help="CSV file with 'timestamp,humidity' columns")
++    parser.add_argument(
++        "--presence-csv",
++        default=None,
++        help="Optional CSV file with 'timestamp,presence' columns (on/off).",
++    )
+     parser.add_argument(
+         "--humidity-threshold", type=float, default=DEFAULT_HUMIDITY_THRESHOLD
+     )
+@@ -115,18 +177,30 @@ def _main() -> None:
+         default=None,
+         help="Optional duration fallback (disabled by default).",
+     )
++    parser.add_argument(
++        "--presence-confirmation-window-seconds",
++        type=float,
++        default=DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
++    )
+     args = parser.parse_args()
+ 
+     readings = load_readings_from_csv(args.csv_file)
++    presence_readings = (
++        load_presence_readings_from_csv(args.presence_csv) if args.presence_csv else None
++    )
+     result = replay(
+         readings,
+         humidity_threshold=args.humidity_threshold,
+         cooldown_seconds=args.cooldown_seconds,
+         max_humidity_delta=args.max_humidity_delta,
+         max_session_seconds=args.max_session_seconds,
++        presence_confirmation_window_seconds=args.presence_confirmation_window_seconds,
++        presence_readings=presence_readings,
+     )
+ 
+-    print(f"Replayed {len(readings)} readings.\n")
++    print(f"Replayed {len(readings)} readings" + (
++        f" and {len(presence_readings)} presence events.\n" if presence_readings else ".\n"
++    ))
+ 
+     print("Session state changes:")
+     for change in result.state_changes:
+diff --git a/tests/test_actuator_integration.py b/tests/test_actuator_integration.py
+index 93245fa..5179924 100644
+--- a/tests/test_actuator_integration.py
++++ b/tests/test_actuator_integration.py
+@@ -70,7 +70,9 @@ def callback_for(captured, entity_id):
+ 
+ 
+ def test_actuator_called_on_replay_spike():
+-    """Set up the integration, replay the humidity spike, assert script call."""
++    """Set up the integration, confirm presence, replay the humidity spike,
++    assert script call. Presence confirmation is required as of ADR-0003 —
++    without it this same humidity spike would never cut."""
+     hass = make_hass()
+     captured = patch_track_state_change()
+ 
+@@ -91,6 +93,11 @@ def test_actuator_called_on_replay_spike():
+     )
+ 
+     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
++    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
++
++    # Someone's confirmed in the bathroom for the whole sequence below.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
++    asyncio.run(presence_callback(event))
+ 
+     # Feed the sequence that starts at ~75.6 and rises to >90
+     readings = [
+@@ -118,7 +125,8 @@ def test_actuator_called_on_replay_spike():
+ 
+ 
+ def test_actuator_calls_restore_after_humidity_falls():
+-    """Simulate a cut followed by humidity falling back below delta and assert restore script called."""
++    """Simulate a cut (with presence confirmed) followed by humidity falling
++    back below delta, and assert restore script called."""
+     hass = make_hass()
+     captured = patch_track_state_change()
+ 
+@@ -138,6 +146,10 @@ def test_actuator_calls_restore_after_humidity_falls():
+     )
+ 
+     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
++    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
++    asyncio.run(presence_callback(event))
+ 
+     # Trigger cut: rapid rise
+     for h in [75.6, 82.63, 87.03, 91.83]:
+diff --git a/tests/test_decision.py b/tests/test_decision.py
+index 65f9f5b..010d573 100644
+--- a/tests/test_decision.py
++++ b/tests/test_decision.py
+@@ -1,7 +1,8 @@
+ # ---
+-# purpose: Tests for the Decision Engine layer (v1.1 humidity delta + optional
+-#          duration fallback, v0.6 presence) and DecisionLog (v0.4).
+-# version: 1.1.0
++# purpose: Tests for the Decision Engine layer — humidity delta gated by
++#          presence confirmation (v1.4, ADR-0003), optional duration
++#          fallback (independent of presence), and DecisionLog (v0.4).
++# version: 1.4.0
+ # ---
+ 
+ import sys
+@@ -46,7 +47,7 @@ def test_idle_state_water_available():
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Humidity delta (v1.1) — the sole cutoff trigger besides presence
++# Humidity delta below threshold -> always available regardless of presence
+ # ---------------------------------------------------------------------------
+ 
+ def test_humidity_delta_within_threshold_stays_available():
+@@ -58,14 +59,46 @@ def test_humidity_delta_within_threshold_stays_available():
+         now=t(60),
+         humidity=85.0,
+         active_since_humidity=75.0,
++        presence=True,
+     )
+     assert result.decision is Decision.WATER_AVAILABLE
+     assert result.humidity_delta == 10.0
+ 
+ 
+-def test_humidity_delta_at_threshold_cuts_water():
+-    """A humidity rise meeting the threshold cuts water immediately,
+-    regardless of how little time has elapsed."""
++def test_cold_shower_low_delta_stays_available_indefinitely():
++    """A cold shower (low humidity delta) is not penalized just for running
++    long, even with presence confirmed — delta must exceed the threshold
++    before presence is even considered."""
++    engine = DecisionEngine(max_humidity_delta=15.0)
++    result = engine.evaluate(
++        SessionState.ACTIVE,
++        active_since=t(0),
++        now=t(3600),  # an hour later
++        humidity=77.0,
++        active_since_humidity=75.0,
++        presence=True,
++    )
++    assert result.decision is Decision.WATER_AVAILABLE
++    assert result.humidity_delta == 2.0
++
++
++def test_missing_humidity_data_has_no_cutoff():
++    """Without humidity/active_since_humidity, there is no delta trigger at
++    all, regardless of presence — water stays available."""
++    engine = DecisionEngine(max_humidity_delta=15.0)
++    result = engine.evaluate(
++        SessionState.ACTIVE, active_since=t(0), now=t(300), presence=True
++    )
++    assert result.decision is Decision.WATER_AVAILABLE
++    assert result.humidity_delta is None
++
++
++# ---------------------------------------------------------------------------
++# Humidity delta exceeded + presence confirmed (ADR-0003) -> cut
++# ---------------------------------------------------------------------------
++
++def test_delta_exceeded_with_presence_true_cuts_water():
++    """Delta at/above threshold AND presence currently True -> cut."""
+     engine = DecisionEngine(max_humidity_delta=15.0)
+     result = engine.evaluate(
+         SessionState.ACTIVE,
+@@ -73,51 +106,120 @@ def test_humidity_delta_at_threshold_cuts_water():
+         now=t(5),
+         humidity=90.0,
+         active_since_humidity=75.0,
++        presence=True,
+     )
+     assert result.decision is Decision.WATER_CUT
+     assert result.humidity_delta == 15.0
+     assert "humidity rose" in result.reason.lower()
++    assert "presence confirmed" in result.reason.lower()
+ 
+ 
+-def test_cold_shower_low_delta_stays_available_indefinitely():
+-    """A cold shower (low humidity delta) is not penalized just for running
+-    long — there is no duration-based fallback."""
++def test_delta_exceeded_with_recent_last_presence_at_cuts_water():
++    """Delta exceeded, presence currently unknown/False, but was seen True
++    within the confirmation window -> still cuts (tolerates a brief mmWave
++    dropout instead of requiring continuous detection at this instant)."""
++    engine = DecisionEngine(
++        max_humidity_delta=15.0, presence_confirmation_window_seconds=60.0
++    )
++    result = engine.evaluate(
++        SessionState.ACTIVE,
++        active_since=t(0),
++        now=t(90),
++        humidity=90.0,
++        active_since_humidity=75.0,
++        presence=False,
++        last_presence_at=t(50),  # 40s before "now" — within the 60s window
++    )
++    assert result.decision is Decision.WATER_CUT
++    assert "presence confirmed" in result.reason.lower()
++
++
++def test_delta_exceeded_but_last_presence_outside_window_does_not_cut():
++    """Delta exceeded, but the last confirmed presence is older than the
++    confirmation window -> not confirmed, water stays available."""
++    engine = DecisionEngine(
++        max_humidity_delta=15.0, presence_confirmation_window_seconds=60.0
++    )
++    result = engine.evaluate(
++        SessionState.ACTIVE,
++        active_since=t(0),
++        now=t(200),
++        humidity=90.0,
++        active_since_humidity=75.0,
++        presence=False,
++        last_presence_at=t(100),  # 100s before "now" — outside the 60s window
++    )
++    assert result.decision is Decision.WATER_AVAILABLE
++    assert "not cutting" in result.reason.lower()
++
++
++def test_delta_exceeded_with_presence_none_does_not_cut():
++    """Delta exceeded but no presence data at all (no presence sensor
++    configured) -> never confirmed, water stays available. This is the key
++    behavior change from the old delta-alone-cuts policy (ADR-0003)."""
+     engine = DecisionEngine(max_humidity_delta=15.0)
+     result = engine.evaluate(
+         SessionState.ACTIVE,
+         active_since=t(0),
+-        now=t(3600),  # an hour later
+-        humidity=77.0,
++        now=t(5),
++        humidity=90.0,
+         active_since_humidity=75.0,
+     )
+     assert result.decision is Decision.WATER_AVAILABLE
+-    assert result.humidity_delta == 2.0
++    assert result.humidity_delta == 15.0
++    assert "not cutting" in result.reason.lower()
++
++
++def test_delta_exceeded_with_presence_false_and_no_last_presence_does_not_cut():
++    """Delta exceeded, presence explicitly False, and no prior confirmation
++    on record -> not confirmed, stays available."""
++    engine = DecisionEngine(max_humidity_delta=15.0)
++    result = engine.evaluate(
++        SessionState.ACTIVE,
++        active_since=t(0),
++        now=t(5),
++        humidity=90.0,
++        active_since_humidity=75.0,
++        presence=False,
++    )
++    assert result.decision is Decision.WATER_AVAILABLE
+ 
+ 
+-def test_custom_max_humidity_delta():
+-    """Engine respects a custom max_humidity_delta value."""
++def test_custom_max_humidity_delta_still_requires_presence():
++    """Engine respects a custom max_humidity_delta value, and the presence
++    gate still applies at the custom threshold."""
+     engine = DecisionEngine(max_humidity_delta=5.0)
+     below = engine.evaluate(
+-        SessionState.ACTIVE, active_since=t(0), now=t(60), humidity=74.0, active_since_humidity=70.0
++        SessionState.ACTIVE,
++        active_since=t(0),
++        now=t(60),
++        humidity=74.0,
++        active_since_humidity=70.0,
++        presence=True,
++    )
++    at_threshold_no_presence = engine.evaluate(
++        SessionState.ACTIVE,
++        active_since=t(0),
++        now=t(60),
++        humidity=75.0,
++        active_since_humidity=70.0,
+     )
+-    at_threshold = engine.evaluate(
+-        SessionState.ACTIVE, active_since=t(0), now=t(60), humidity=75.0, active_since_humidity=70.0
++    at_threshold_with_presence = engine.evaluate(
++        SessionState.ACTIVE,
++        active_since=t(0),
++        now=t(60),
++        humidity=75.0,
++        active_since_humidity=70.0,
++        presence=True,
+     )
+     assert below.decision is Decision.WATER_AVAILABLE
+-    assert at_threshold.decision is Decision.WATER_CUT
+-
+-
+-def test_missing_humidity_data_has_no_cutoff():
+-    """Without humidity/active_since_humidity, there is no trigger at all
+-    (besides presence) — water stays available."""
+-    engine = DecisionEngine(max_humidity_delta=15.0)
+-    result = engine.evaluate(SessionState.ACTIVE, active_since=t(0), now=t(300))
+-    assert result.decision is Decision.WATER_AVAILABLE
+-    assert result.humidity_delta is None
++    assert at_threshold_no_presence.decision is Decision.WATER_AVAILABLE
++    assert at_threshold_with_presence.decision is Decision.WATER_CUT
+ 
+ 
+-def test_cooldown_state_delta_still_evaluated():
+-    """COOLDOWN counts toward the same session — delta still applies."""
++def test_cooldown_state_delta_still_evaluated_with_presence():
++    """COOLDOWN counts toward the same session — delta+presence still
++    applies."""
+     engine = DecisionEngine(max_humidity_delta=15.0)
+     result = engine.evaluate(
+         SessionState.COOLDOWN,
+@@ -125,12 +227,13 @@ def test_cooldown_state_delta_still_evaluated():
+         now=t(30),
+         humidity=91.0,
+         active_since_humidity=75.0,
++        presence=True,
+     )
+     assert result.decision is Decision.WATER_CUT
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Optional duration fallback (disabled by default)
++# Optional duration fallback — independent of presence (ADR-0003)
+ # ---------------------------------------------------------------------------
+ 
+ def test_duration_fallback_disabled_by_default():
+@@ -147,9 +250,10 @@ def test_duration_fallback_disabled_by_default():
+     assert result.decision is Decision.WATER_AVAILABLE
+ 
+ 
+-def test_duration_fallback_cuts_water_when_enabled():
++def test_duration_fallback_cuts_water_when_enabled_without_presence():
+     """With max_session_seconds set, a low-delta session is still capped
+-    once it runs past the configured duration."""
++    once it runs past the configured duration — no presence data needed,
++    since this is the safety net for exactly that case."""
+     engine = DecisionEngine(max_humidity_delta=15.0, max_session_seconds=900)
+     result = engine.evaluate(
+         SessionState.ACTIVE,
+@@ -175,9 +279,9 @@ def test_duration_fallback_does_not_trigger_before_limit():
+     assert result.decision is Decision.WATER_AVAILABLE
+ 
+ 
+-def test_humidity_delta_takes_priority_over_duration_fallback():
+-    """When both would trigger, the delta policy is evaluated first and its
+-    reason wins."""
++def test_confirmed_delta_cut_takes_priority_over_duration_fallback():
++    """When both would trigger, the delta+presence policy is evaluated
++    first and its reason wins."""
+     engine = DecisionEngine(max_humidity_delta=15.0, max_session_seconds=900)
+     result = engine.evaluate(
+         SessionState.ACTIVE,
+@@ -185,25 +289,27 @@ def test_humidity_delta_takes_priority_over_duration_fallback():
+         now=t(900),
+         humidity=95.0,
+         active_since_humidity=75.0,
++        presence=True,
+     )
+     assert result.decision is Decision.WATER_CUT
+     assert "humidity rose" in result.reason.lower()
+ 
+ 
+-def test_presence_absent_takes_priority_over_duration_fallback():
+-    """presence=False still cuts immediately even with the duration fallback
+-    configured and not yet elapsed."""
++def test_unconfirmed_delta_falls_through_to_duration_fallback():
++    """Delta exceeded but not presence-confirmed doesn't cut on its own —
++    but if the duration fallback is also configured and elapsed, that still
++    catches the session independently."""
+     engine = DecisionEngine(max_humidity_delta=15.0, max_session_seconds=900)
+     result = engine.evaluate(
+         SessionState.ACTIVE,
+         active_since=t(0),
+-        now=t(5),
+-        humidity=76.0,
++        now=t(900),
++        humidity=95.0,
+         active_since_humidity=75.0,
+-        presence=False,
++        # no presence data at all
+     )
+     assert result.decision is Decision.WATER_CUT
+-    assert "presence" in result.reason.lower()
++    assert "exceeded max duration" in result.reason.lower()
+ 
+ 
+ def test_decision_result_str_is_readable():
+@@ -224,48 +330,10 @@ def test_decision_result_str_is_readable():
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Presence (v0.6, optional) — takes priority over humidity delta
++# Idle stays available regardless of presence
+ # ---------------------------------------------------------------------------
+ 
+-def test_presence_absent_cuts_water_immediately():
+-    """presence=False cuts water even with a tiny humidity delta."""
+-    engine = DecisionEngine(max_humidity_delta=15.0)
+-    result = engine.evaluate(
+-        SessionState.ACTIVE,
+-        active_since=t(0),
+-        now=t(5),
+-        humidity=76.0,
+-        active_since_humidity=75.0,
+-        presence=False,
+-    )
+-    assert result.decision is Decision.WATER_CUT
+-    assert "presence" in result.reason.lower()
+-
+-
+-def test_presence_present_falls_back_to_humidity_delta_policy():
+-    """presence=True behaves the same as presence=None (delta policy)."""
+-    engine = DecisionEngine(max_humidity_delta=15.0)
+-    within = engine.evaluate(
+-        SessionState.ACTIVE,
+-        active_since=t(0),
+-        now=t(60),
+-        humidity=85.0,
+-        active_since_humidity=75.0,
+-        presence=True,
+-    )
+-    exceeded = engine.evaluate(
+-        SessionState.ACTIVE,
+-        active_since=t(0),
+-        now=t(60),
+-        humidity=91.0,
+-        active_since_humidity=75.0,
+-        presence=True,
+-    )
+-    assert within.decision is Decision.WATER_AVAILABLE
+-    assert exceeded.decision is Decision.WATER_CUT
+-
+-
+-def test_presence_absent_but_idle_stays_water_available():
++def test_idle_stays_water_available_regardless_of_presence():
+     """No active session -> water available regardless of presence."""
+     engine = DecisionEngine()
+     result = engine.evaluate(
+@@ -315,39 +383,3 @@ def test_decision_log_evicts_oldest_beyond_max_entries():
+     assert len(log) == 2
+     assert log.entries == (r2, r3)
+     assert log.last is r3
+-
+-
+-if __name__ == "__main__":
+-    tests = [
+-        test_idle_state_water_available,
+-        test_humidity_delta_within_threshold_stays_available,
+-        test_humidity_delta_at_threshold_cuts_water,
+-        test_cold_shower_low_delta_stays_available_indefinitely,
+-        test_custom_max_humidity_delta,
+-        test_missing_humidity_data_has_no_cutoff,
+-        test_cooldown_state_delta_still_evaluated,
+-        test_duration_fallback_disabled_by_default,
+-        test_duration_fallback_cuts_water_when_enabled,
+-        test_duration_fallback_does_not_trigger_before_limit,
+-        test_humidity_delta_takes_priority_over_duration_fallback,
+-        test_presence_absent_takes_priority_over_duration_fallback,
+-        test_decision_result_str_is_readable,
+-        test_presence_absent_cuts_water_immediately,
+-        test_presence_present_falls_back_to_humidity_delta_policy,
+-        test_presence_absent_but_idle_stays_water_available,
+-        test_decision_log_starts_empty,
+-        test_decision_log_records_entries_in_order,
+-        test_decision_log_evicts_oldest_beyond_max_entries,
+-    ]
+-    passed = 0
+-    failed = 0
+-    for t_fn in tests:
+-        try:
+-            t_fn()
+-            print(f"PASS  {t_fn.__name__}")
+-            passed += 1
+-        except Exception as e:
+-            print(f"FAIL  {t_fn.__name__}: {e}")
+-            failed += 1
+-    print(f"\n{passed} passed, {failed} failed")
+-
+diff --git a/tests/test_init.py b/tests/test_init.py
+index 75fcabe..68e3ce5 100644
+--- a/tests/test_init.py
++++ b/tests/test_init.py
+@@ -1,15 +1,16 @@
+ # ---
+ # purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
+-#          -> DecisionLog wiring (v0.2/v0.3/v0.4), the optional presence
+-#          sensor wiring (v0.6), the actuator script wiring (v1.0), the
+-#          humidity-delta cutoff policy (v1.1), and the optional duration
+-#          fallback enabled only when no presence_sensor is configured.
+-# version: 1.1.0
++#          -> DecisionLog wiring (v0.2/v0.3/v0.4), the actuator script wiring
++#          (v1.0), the humidity-delta cutoff gated by presence confirmation
++#          (v1.4, ADR-0003), and the duration fallback (independent of
++#          presence, off unless explicitly configured).
++# version: 1.4.0
+ # ---
+ 
+ import asyncio
+ import sys
+ import os
++from datetime import datetime
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock
+ 
+@@ -74,6 +75,15 @@ def make_hass():
+     return SimpleNamespace(data={}, services=FakeServices(), states=FakeStates())
+ 
+ 
++def confirm_presence(hass, at=None):
++    """Directly mark presence as confirmed, for tests focused on the
++    delta/actuator/notify path that don't need to simulate a full presence
++    sensor wiring. Must be called after async_setup (hass.data[DOMAIN] must
++    already exist)."""
++    hass.data[DOMAIN]["presence"] = True
++    hass.data[DOMAIN]["last_presence_at"] = at or datetime.now()
++
++
+ def patch_track_state_change(monkeypatch_target=shower_guard):
+     """Replace async_track_state_change_event with a spy and return the
+     capture dict. Supports multiple registrations (e.g. humidity + presence);
+@@ -140,8 +150,9 @@ def test_async_setup_registers_state_listener():
+     assert hass.data[DOMAIN]["last_decision"] is None
+     assert hass.data[DOMAIN]["presence"] is None
+     assert len(captured["registrations"]) == 1  # no presence_sensor configured
+-    # No presence_sensor -> duration fallback is enabled by default.
+-    assert hass.data[DOMAIN]["decision_engine"].max_session_seconds == 900.0
++    # Duration fallback is off unless explicitly configured (ADR-0003) —
++    # no longer tied to presence_sensor's mere presence/absence.
++    assert hass.data[DOMAIN]["decision_engine"].max_session_seconds is None
+ 
+ 
+ def test_async_setup_uses_custom_decision_log_size():
+@@ -204,9 +215,10 @@ def test_async_setup_uses_custom_max_session_seconds_without_presence_sensor():
+     assert engine.max_session_seconds == 60
+ 
+ 
+-def test_presence_sensor_disables_duration_fallback():
+-    """Configuring a presence_sensor disables the duration fallback, even if
+-    max_session_seconds is also set — presence already handles it precisely."""
++def test_presence_sensor_no_longer_disables_duration_fallback():
++    """As of ADR-0003, presence_sensor and the duration fallback are
++    independent — configuring both keeps max_session_seconds active,
++    unlike the old coupling where presence_sensor forced it off."""
+     hass = make_hass()
+     patch_track_state_change()
+ 
+@@ -224,7 +236,7 @@ def test_presence_sensor_disables_duration_fallback():
+     )
+ 
+     engine = hass.data[DOMAIN]["decision_engine"]
+-    assert engine.max_session_seconds is None
++    assert engine.max_session_seconds == 60
+ 
+ 
+ def test_async_setup_uses_custom_threshold_and_cooldown():
+@@ -345,7 +357,10 @@ def test_humidity_callback_records_water_available_decision():
+     assert last_decision.decision is Decision.WATER_AVAILABLE
+ 
+ 
+-def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold():
++def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold_with_presence():
++    """Delta exceeding threshold cuts water only with presence confirmed
++    (ADR-0003) — using confirm_presence() to focus on the delta/actuator
++    path without re-testing presence wiring itself here."""
+     hass = make_hass()
+     captured = patch_track_state_change()
+ 
+@@ -360,6 +375,7 @@ def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold():
+             },
+         )
+     )
++    confirm_presence(hass)
+ 
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(captured["callback"](event))
+@@ -368,6 +384,33 @@ def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold():
+     assert last_decision.decision is Decision.WATER_CUT
+ 
+ 
++def test_humidity_callback_does_not_cut_on_delta_alone_without_presence():
++    """Exceeding max_humidity_delta with no presence data at all (no
++    presence_sensor configured) does not cut water — the key behavior
++    change from the old delta-alone-cuts policy (ADR-0003)."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass,
++            {
++                DOMAIN: {
++                    "humidity_sensor": "sensor.bathroom_humidity",
++                    "max_humidity_delta": 0,
++                }
++            },
++        )
++    )
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
++    asyncio.run(captured["callback"](event))
++
++    last_decision = hass.data[DOMAIN]["last_decision"]
++    assert last_decision.decision is Decision.WATER_AVAILABLE
++    assert "not cutting" in last_decision.reason.lower()
++
++
+ # ---------------------------------------------------------------------------
+ # DecisionLog wiring (v0.4 — every evaluation is recorded, not just changes)
+ # ---------------------------------------------------------------------------
+@@ -416,7 +459,11 @@ def test_async_setup_registers_presence_listener_when_configured():
+     callback_for(captured, "binary_sensor.bathroom_presence")  # raises if missing
+ 
+ 
+-def test_presence_absent_cuts_water_immediately_during_active_session():
++def test_delta_exceeded_stays_available_until_presence_confirmed():
++    """Delta exceeds threshold while presence is still unconfirmed -> stays
++    available. Once presence reports 'on', the same already-exceeded delta
++    triggers a cut on re-evaluation without waiting for a new humidity
++    reading (ADR-0003)."""
+     hass = make_hass()
+     captured = patch_track_state_change()
+ 
+@@ -427,6 +474,7 @@ def test_presence_absent_cuts_water_immediately_during_active_session():
+                 DOMAIN: {
+                     "humidity_sensor": "sensor.bathroom_humidity",
+                     "presence_sensor": "binary_sensor.bathroom_presence",
++                    "max_humidity_delta": 0,
+                 }
+             },
+         )
+@@ -435,20 +483,61 @@ def test_presence_absent_cuts_water_immediately_during_active_session():
+     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+     presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+ 
+-    # Shower starts — no presence info yet, so the humidity-delta policy applies.
++    # Delta exceeds threshold immediately, but presence hasn't been
++    # confirmed yet -> stays available.
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(humidity_callback(event))
+     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+ 
+-    # Presence sensor reports the room is now empty — immediate cut, even
+-    # though the humidity delta is still small and no new humidity arrived.
++    # Presence sensor now reports someone's there -> re-evaluation on the
++    # already-exceeded delta cuts water immediately.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
++    asyncio.run(presence_callback(event))
++
++    assert hass.data[DOMAIN]["presence"] is True
++    last_decision = hass.data[DOMAIN]["last_decision"]
++    assert last_decision.decision is Decision.WATER_CUT
++    assert "presence confirmed" in last_decision.reason.lower()
++
++
++def test_presence_flicker_off_within_window_still_cuts():
++    """Presence flipping back to 'off' shortly after confirming doesn't
++    immediately reverse an active cut — the confirmation window tolerates a
++    brief mmWave dropout instead of requiring continuous detection."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass,
++            {
++                DOMAIN: {
++                    "humidity_sensor": "sensor.bathroom_humidity",
++                    "presence_sensor": "binary_sensor.bathroom_presence",
++                    "max_humidity_delta": 0,
++                }
++            },
++        )
++    )
++
++    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
++    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
++    asyncio.run(presence_callback(event))
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
++    asyncio.run(humidity_callback(event))
++    assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_CUT
++
++    # Presence flickers off (radar dropout) -> re-evaluation still finds the
++    # last confirmation within the default 60s window -> stays cut.
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
+     asyncio.run(presence_callback(event))
+ 
+     assert hass.data[DOMAIN]["presence"] is False
+     last_decision = hass.data[DOMAIN]["last_decision"]
+     assert last_decision.decision is Decision.WATER_CUT
+-    assert "presence" in last_decision.reason.lower()
+ 
+ 
+ def test_presence_callback_ignores_unknown_state():
+@@ -555,6 +644,7 @@ def test_actuator_called_on_water_cut_decision():
+             },
+         )
+     )
++    confirm_presence(hass)
+ 
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(captured["callback"](event))
+@@ -587,6 +677,7 @@ def test_notify_service_called_on_water_cut_decision():
+             },
+         )
+     )
++    confirm_presence(hass)
+ 
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(captured["callback"](event))
+@@ -667,7 +758,7 @@ def test_actuator_not_called_again_when_decision_unchanged():
+ 
+ def test_actuator_only_calls_configured_side():
+     """Only water_cut_script configured -> no call for WATER_AVAILABLE, but a
+-    call is made once the decision flips to WATER_CUT."""
++    call is made once delta exceeds threshold and presence confirms it."""
+     hass = make_hass()
+     captured = patch_track_state_change()
+ 
+@@ -678,6 +769,7 @@ def test_actuator_only_calls_configured_side():
+                 DOMAIN: {
+                     "humidity_sensor": "sensor.bathroom_humidity",
+                     "presence_sensor": "binary_sensor.bathroom_presence",
++                    "max_humidity_delta": 0,
+                     "water_cut_script": "script.cut_water",
+                 }
+             },
+@@ -687,11 +779,15 @@ def test_actuator_only_calls_configured_side():
+     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+     presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+ 
++    # Delta exceeds immediately, but presence isn't confirmed yet -> stays
++    # available, no actuator call (water_available_script isn't configured
++    # either, so this also confirms that side stays silent).
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(humidity_callback(event))
+-    assert hass.services.calls == []  # water_available_script not configured
++    assert hass.services.calls == []
+ 
+-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
++    # Presence confirms -> re-evaluation cuts and calls the configured script.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
+     asyncio.run(presence_callback(event))
+ 
+     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_CUT
+@@ -825,7 +921,7 @@ def test_baseline_humidity_resets_on_sibling_resume():
+ 
+ def test_humidity_delta_cuts_water_quickly_via_wiring():
+     """A fast humidity rise cuts water immediately through the full wiring,
+-    regardless of how little time has elapsed."""
++    regardless of how little time has elapsed, given presence is confirmed."""
+     hass = make_hass()
+     captured = patch_track_state_change()
+ 
+@@ -840,6 +936,7 @@ def test_humidity_delta_cuts_water_quickly_via_wiring():
+             },
+         )
+     )
++    confirm_presence(hass)
+ 
+     # Session starts at the threshold (baseline = 75.0).
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+@@ -955,9 +1052,10 @@ def test_duration_fallback_cuts_water_via_wiring_without_presence_sensor():
+     assert "exceeded max duration" in last_decision.reason.lower()
+ 
+ 
+-def test_duration_fallback_disabled_via_wiring_with_presence_sensor():
+-    """The same max_session_seconds=0 has no effect once a presence_sensor is
+-    configured — the duration fallback is disabled in favor of presence."""
++def test_duration_fallback_still_active_via_wiring_with_presence_sensor():
++    """As of ADR-0003, max_session_seconds is independent of presence_sensor
++    — with both configured, the duration fallback still fires, unlike the
++    old coupling where presence_sensor forced it off."""
+     hass = make_hass()
+     captured = patch_track_state_change()
+ 
+@@ -980,7 +1078,8 @@ def test_duration_fallback_disabled_via_wiring_with_presence_sensor():
+     asyncio.run(humidity_callback(event))
+ 
+     last_decision = hass.data[DOMAIN]["last_decision"]
+-    assert last_decision.decision is Decision.WATER_AVAILABLE
++    assert last_decision.decision is Decision.WATER_CUT
++    assert "exceeded max duration" in last_decision.reason.lower()
+ 
+ 
+ if __name__ == "__main__":
+@@ -991,17 +1090,19 @@ if __name__ == "__main__":
+         test_async_setup_uses_custom_decision_log_size,
+         test_async_setup_uses_custom_max_humidity_delta,
+         test_async_setup_uses_custom_max_session_seconds_without_presence_sensor,
+-        test_presence_sensor_disables_duration_fallback,
++        test_presence_sensor_no_longer_disables_duration_fallback,
+         test_async_setup_uses_custom_threshold_and_cooldown,
+         test_humidity_callback_feeds_detector,
+         test_humidity_callback_ignores_unavailable_state,
+         test_humidity_callback_ignores_non_numeric_state,
+         test_humidity_callback_ignores_missing_new_state,
+         test_humidity_callback_records_water_available_decision,
+-        test_humidity_callback_records_water_cut_when_delta_exceeds_threshold,
++        test_humidity_callback_records_water_cut_when_delta_exceeds_threshold_with_presence,
++        test_humidity_callback_does_not_cut_on_delta_alone_without_presence,
+         test_humidity_callback_records_every_evaluation_in_decision_log,
+         test_async_setup_registers_presence_listener_when_configured,
+-        test_presence_absent_cuts_water_immediately_during_active_session,
++        test_delta_exceeded_stays_available_until_presence_confirmed,
++        test_presence_flicker_off_within_window_still_cuts,
+         test_presence_callback_ignores_unknown_state,
+         test_no_presence_listener_when_not_configured,
+         test_actuator_not_called_when_no_scripts_configured,
+@@ -1013,7 +1114,7 @@ if __name__ == "__main__":
+         test_cold_shower_stays_available_indefinitely_below_delta,
+         test_sibling_shower_gets_fresh_baseline_after_resume,
+         test_duration_fallback_cuts_water_via_wiring_without_presence_sensor,
+-        test_duration_fallback_disabled_via_wiring_with_presence_sensor,
++        test_duration_fallback_still_active_via_wiring_with_presence_sensor,
+     ]
+     passed = 0
+     failed = 0
+diff --git a/tests/test_replay.py b/tests/test_replay.py
+index c945c14..2b7c43b 100644
+--- a/tests/test_replay.py
++++ b/tests/test_replay.py
+@@ -70,10 +70,40 @@ def test_replay_records_a_decision_per_reading():
+     assert len(result.decision_log) == 3
+ 
+ 
+-def test_replay_water_cut_when_humidity_delta_exceeds_threshold():
++def test_replay_water_cut_when_humidity_delta_exceeds_threshold_with_presence():
++    """As of ADR-0003, delta alone isn't enough in replay either — presence
++    readings must be supplied and confirm within the window."""
++    readings = [(t(0), 75.0), (t(60), 92.0)]
++    presence_readings = [(t(0), True)]
++    result = replay(
++        readings, max_humidity_delta=15.0, presence_readings=presence_readings
++    )
++
++    assert result.decision_log.last.decision is Decision.WATER_CUT
++
++
++def test_replay_water_cut_does_not_happen_without_presence_data():
++    """The same delta spike, with no presence_readings supplied at all,
++    never confirms and stays available — matching production behavior with
++    no presence_sensor configured."""
+     readings = [(t(0), 75.0), (t(60), 92.0)]
+     result = replay(readings, max_humidity_delta=15.0)
+ 
++    assert result.decision_log.last.decision is Decision.WATER_AVAILABLE
++
++
++def test_replay_presence_confirmation_tolerates_brief_gap():
++    """Presence seen True once, then not reported again, still confirms a
++    later delta-triggered cut within the confirmation window."""
++    readings = [(t(0), 75.0), (t(50), 92.0)]
++    presence_readings = [(t(0), True), (t(10), False)]
++    result = replay(
++        readings,
++        max_humidity_delta=15.0,
++        presence_confirmation_window_seconds=60.0,
++        presence_readings=presence_readings,
++    )
++
+     assert result.decision_log.last.decision is Decision.WATER_CUT
+ 
+ 
+@@ -151,7 +181,9 @@ if __name__ == "__main__":
+         test_replay_empty_readings_produces_empty_result,
+         test_replay_full_session_lifecycle,
+         test_replay_records_a_decision_per_reading,
+-        test_replay_water_cut_when_humidity_delta_exceeds_threshold,
++        test_replay_water_cut_when_humidity_delta_exceeds_threshold_with_presence,
++        test_replay_water_cut_does_not_happen_without_presence_data,
++        test_replay_presence_confirmation_tolerates_brief_gap,
+         test_replay_duration_fallback_disabled_by_default,
+         test_replay_duration_fallback_cuts_water_when_enabled,
+         test_replay_respects_custom_threshold_and_cooldown,
+-- 
+2.43.0
+

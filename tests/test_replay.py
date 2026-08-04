@@ -70,9 +70,39 @@ def test_replay_records_a_decision_per_reading():
     assert len(result.decision_log) == 3
 
 
-def test_replay_water_cut_when_humidity_delta_exceeds_threshold():
+def test_replay_water_cut_when_humidity_delta_exceeds_threshold_with_presence():
+    """As of ADR-0003, delta alone isn't enough in replay either — presence
+    readings must be supplied and confirm within the window."""
+    readings = [(t(0), 75.0), (t(60), 92.0)]
+    presence_readings = [(t(0), True)]
+    result = replay(
+        readings, max_humidity_delta=15.0, presence_readings=presence_readings
+    )
+
+    assert result.decision_log.last.decision is Decision.WATER_CUT
+
+
+def test_replay_water_cut_does_not_happen_without_presence_data():
+    """The same delta spike, with no presence_readings supplied at all,
+    never confirms and stays available — matching production behavior with
+    no presence_sensor configured."""
     readings = [(t(0), 75.0), (t(60), 92.0)]
     result = replay(readings, max_humidity_delta=15.0)
+
+    assert result.decision_log.last.decision is Decision.WATER_AVAILABLE
+
+
+def test_replay_presence_confirmation_tolerates_brief_gap():
+    """Presence seen True once, then not reported again, still confirms a
+    later delta-triggered cut within the confirmation window."""
+    readings = [(t(0), 75.0), (t(50), 92.0)]
+    presence_readings = [(t(0), True), (t(10), False)]
+    result = replay(
+        readings,
+        max_humidity_delta=15.0,
+        presence_confirmation_window_seconds=60.0,
+        presence_readings=presence_readings,
+    )
 
     assert result.decision_log.last.decision is Decision.WATER_CUT
 
@@ -151,7 +181,9 @@ if __name__ == "__main__":
         test_replay_empty_readings_produces_empty_result,
         test_replay_full_session_lifecycle,
         test_replay_records_a_decision_per_reading,
-        test_replay_water_cut_when_humidity_delta_exceeds_threshold,
+        test_replay_water_cut_when_humidity_delta_exceeds_threshold_with_presence,
+        test_replay_water_cut_does_not_happen_without_presence_data,
+        test_replay_presence_confirmation_tolerates_brief_gap,
         test_replay_duration_fallback_disabled_by_default,
         test_replay_duration_fallback_cuts_water_when_enabled,
         test_replay_respects_custom_threshold_and_cooldown,

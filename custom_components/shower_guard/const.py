@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 1.3.0
+# version: 1.4.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # Session Detection
 # Humidity level (% RH) that triggers session start.
@@ -28,10 +28,12 @@ CONF_COOLDOWN_SECONDS = "cooldown_seconds"
 DEFAULT_MAX_HUMIDITY_DELTA: float = 15.0
 CONF_MAX_HUMIDITY_DELTA = "max_humidity_delta"
 
-# Optional duration-based fallback (see ADR-0001). Only wired in when no
-# presence_sensor is configured — with a presence sensor, an unattended
-# session is already caught precisely; without one, this is the safety net
-# for a session whose humidity never rises enough to trip the delta policy.
+# Optional duration-based fallback (see ADR-0001, ADR-0003). Disabled unless
+# explicitly configured — independent of whether a presence sensor is set,
+# since presence confirmation now gates the delta cutoff (see ADR-0003)
+# rather than substituting for a duration safety net. This remains the
+# fallback for a session whose humidity never rises enough to trip the delta
+# policy, or that never gets a presence confirmation.
 DEFAULT_MAX_SESSION_SECONDS: float = 900.0  # 15 minutes
 CONF_MAX_SESSION_SECONDS = "max_session_seconds"
 
@@ -40,10 +42,21 @@ CONF_MAX_SESSION_SECONDS = "max_session_seconds"
 DEFAULT_DECISION_LOG_SIZE: int = 100
 CONF_DECISION_LOG_SIZE = "decision_log_size"
 
-# Presence Sensor (optional Sensor Layer input, see ADR-0001)
-# When configured, an active session with no presence detected cuts water
-# immediately, regardless of humidity delta.
+# Presence Sensor (optional Sensor Layer input, see ADR-0001, ADR-0003)
+# When configured, presence acts as a *confirmation gate* on the humidity
+# delta cutoff (policy 3), not an independent trigger: water is only cut once
+# delta exceeds max_humidity_delta AND presence has been detected within the
+# last presence_confirmation_window_seconds. Without a presence sensor
+# configured, delta alone never cuts water — configure max_session_seconds
+# as a fallback in that case.
 CONF_PRESENCE_SENSOR = "presence_sensor"
+
+# How recently presence must have been detected (seconds) for it to count as
+# "confirmed" toward the delta cutoff gate above. A window rather than an
+# instantaneous check tolerates brief mmWave dropouts mid-shower without
+# treating them as absence.
+DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS: float = 60.0
+CONF_PRESENCE_CONFIRMATION_WINDOW_SECONDS = "presence_confirmation_window_seconds"
 
 # Actuator (v1.0, see ADR-0001)
 # HA script entities called on a decision change. The Decision Engine never
