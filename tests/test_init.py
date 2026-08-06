@@ -239,7 +239,7 @@ def test_presence_sensor_no_longer_disables_duration_fallback():
     assert engine.max_session_seconds == 60
 
 
-def test_async_setup_uses_custom_threshold_and_cooldown():
+def test_async_setup_uses_custom_start_delta_and_cooldown():
     hass = make_hass()
     patch_track_state_change()
 
@@ -249,7 +249,7 @@ def test_async_setup_uses_custom_threshold_and_cooldown():
             {
                 DOMAIN: {
                     "humidity_sensor": "sensor.bathroom_humidity",
-                    "humidity_threshold": 60.0,
+                    "humidity_start_delta": 5.0,
                     "cooldown_seconds": 30,
                 }
             },
@@ -257,8 +257,28 @@ def test_async_setup_uses_custom_threshold_and_cooldown():
     )
 
     detector = hass.data[DOMAIN]["detector"]
-    assert detector.humidity_threshold == 60.0
+    assert detector.humidity_start_delta == 5.0
     assert detector.cooldown_seconds == 30
+
+
+def test_async_setup_uses_custom_baseline_time_constant():
+    hass = make_hass()
+    patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "baseline_time_constant_seconds": 60.0,
+                }
+            },
+        )
+    )
+
+    detector = hass.data[DOMAIN]["detector"]
+    assert detector.baseline_time_constant_seconds == 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +298,13 @@ def test_humidity_callback_feeds_detector():
     detector = hass.data[DOMAIN]["detector"]
     assert detector.state is SessionState.IDLE
 
+    # First reading only seeds the ambient baseline (v1.5) — it can't start
+    # a session on its own.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
+    assert detector.state is SessionState.IDLE
+
+    # A fast jump well above the barely-moved baseline starts the session.
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
     asyncio.run(captured["callback"](event))
 
@@ -377,6 +404,9 @@ def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold_with_p
     )
     confirm_presence(hass)
 
+    # Seed the baseline, then a rise starts the session with a positive delta.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
     asyncio.run(captured["callback"](event))
 
@@ -403,6 +433,8 @@ def test_humidity_callback_does_not_cut_on_delta_alone_without_presence():
         )
     )
 
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
     asyncio.run(captured["callback"](event))
 
@@ -483,9 +515,11 @@ def test_delta_exceeded_stays_available_until_presence_confirmed():
     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
     presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
 
-    # Delta exceeds threshold immediately, but presence hasn't been
-    # confirmed yet -> stays available.
-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    # Seed the baseline, then a rise starts the session with an exceeded
+    # delta — but presence hasn't been confirmed yet, so it stays available.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(humidity_callback(event))
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
     asyncio.run(humidity_callback(event))
     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
 
@@ -526,7 +560,11 @@ def test_presence_flicker_off_within_window_still_cuts():
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
     asyncio.run(presence_callback(event))
 
-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    # Seed the baseline, then a rise starts the session with an exceeded
+    # delta — presence is already confirmed, so it cuts right away.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(humidity_callback(event))
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
     asyncio.run(humidity_callback(event))
     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_CUT
 
@@ -646,6 +684,8 @@ def test_actuator_called_on_water_cut_decision():
     )
     confirm_presence(hass)
 
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
     asyncio.run(captured["callback"](event))
 
@@ -679,6 +719,8 @@ def test_notify_service_called_on_water_cut_decision():
     )
     confirm_presence(hass)
 
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(captured["callback"](event))
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
     asyncio.run(captured["callback"](event))
 
@@ -779,10 +821,13 @@ def test_actuator_only_calls_configured_side():
     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
     presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
 
-    # Delta exceeds immediately, but presence isn't confirmed yet -> stays
-    # available, no actuator call (water_available_script isn't configured
-    # either, so this also confirms that side stays silent).
-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+    # Seed the baseline, then a rise starts the session with an exceeded
+    # delta — but presence isn't confirmed yet, so it stays available, no
+    # actuator call (water_available_script isn't configured either, so
+    # this also confirms that side stays silent).
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
+    asyncio.run(humidity_callback(event))
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
     asyncio.run(humidity_callback(event))
     assert hass.services.calls == []
 
@@ -817,15 +862,24 @@ def test_humidity_delta_published_on_every_evaluation():
         )
     )
 
-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+    # First reading seeds the baseline (~58) — no session yet, delta unknown.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
     asyncio.run(captured["callback"](event))
     published = hass.states.get("sensor.shower_guard_humidity_delta")
-    assert published["state"] == "0.0"
+    assert published["state"] == "unknown"
 
-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="85.0")})
+    # This rise starts the session — delta is measured from the baseline
+    # (~58), not from this reading itself, so it's ~4.0 (the start delta),
+    # not 0.0 as it would be under the old flat-threshold model.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="62.0")})
     asyncio.run(captured["callback"](event))
     published = hass.states.get("sensor.shower_guard_humidity_delta")
-    assert published["state"] == "10.0"
+    assert published["state"] == "4.0"
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="72.0")})
+    asyncio.run(captured["callback"](event))
+    published = hass.states.get("sensor.shower_guard_humidity_delta")
+    assert published["state"] == "14.0"
     assert published["attributes"]["unit_of_measurement"] == "%"
     assert published["attributes"]["max_humidity_delta"] == 15.0
 
@@ -852,7 +906,10 @@ def test_humidity_delta_published_as_unknown_when_idle():
 
 
 def test_baseline_humidity_published_on_session_start():
-    """Session start publishes the baseline as the STARTED reading."""
+    """Session start publishes the tracked ambient baseline, NOT the raw
+    reading that crossed the start trigger (v1.5, ADR-0004) — this is the
+    actual fix for the bug where a session starting from a high ambient
+    baseline hid its pre-trigger rise from the delta-cutoff policy."""
     hass = make_hass()
     captured = patch_track_state_change()
 
@@ -862,11 +919,13 @@ def test_baseline_humidity_published_on_session_start():
         )
     )
 
-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="76.0")})
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
+    asyncio.run(captured["callback"](event))
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="62.0")})
     asyncio.run(captured["callback"](event))
 
     published = hass.states.get("sensor.shower_guard_baseline_humidity")
-    assert published["state"] == "76.0"
+    assert published["state"] == "58.0"  # the ambient baseline, not "62.0"
     assert published["attributes"]["unit_of_measurement"] == "%"
 
 
@@ -907,7 +966,10 @@ def test_baseline_humidity_resets_on_sibling_resume():
         )
     )
 
-    for state in ("75.0", "60.0", "76.0"):  # start, cooldown, resume (sibling)
+    # seed, start, cooldown, resume (sibling) — one extra seed reading vs.
+    # the old flat-threshold model, since the first reading here only seeds
+    # the baseline rather than starting a session immediately.
+    for state in ("70.0", "76.0", "60.0", "76.0"):
         event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
         asyncio.run(captured["callback"](event))
 
@@ -938,18 +1000,23 @@ def test_humidity_delta_cuts_water_quickly_via_wiring():
     )
     confirm_presence(hass)
 
-    # Session starts at the threshold (baseline = 75.0).
+    # First reading only seeds the baseline (~75.0) — no session yet, so
+    # this evaluation is trivially available (no active session).
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
     asyncio.run(captured["callback"](event))
     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
 
-    # Humidity jumps well past the delta threshold almost immediately.
+    # Humidity jumps well past the delta threshold almost immediately —
+    # this reading both starts the session and exceeds the cutoff delta.
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="85.0")})
     asyncio.run(captured["callback"](event))
 
     last_decision = hass.data[DOMAIN]["last_decision"]
     assert last_decision.decision is Decision.WATER_CUT
-    assert last_decision.humidity_delta == 10.0
+    # The baseline drifts by a negligible amount between the two readings
+    # (real wall-clock microseconds against a 600s EMA time constant), so
+    # compare with a small tolerance rather than exact equality.
+    assert abs(last_decision.humidity_delta - 10.0) < 0.01
 
 
 def test_cold_shower_stays_available_indefinitely_below_delta():
@@ -970,16 +1037,20 @@ def test_cold_shower_stays_available_indefinitely_below_delta():
         )
     )
 
-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+    # Seed the baseline, then a rise that clears the start delta (so the
+    # session actually starts) but stays well under the cutoff delta.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="70.0")})
+    asyncio.run(captured["callback"](event))
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="74.0")})
     asyncio.run(captured["callback"](event))
 
-    # Humidity barely rises — a cold shower generating little steam.
+    # Humidity barely rises further — a cold shower generating little steam.
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="77.0")})
     asyncio.run(captured["callback"](event))
 
     last_decision = hass.data[DOMAIN]["last_decision"]
     assert last_decision.decision is Decision.WATER_AVAILABLE
-    assert last_decision.humidity_delta == 2.0
+    assert abs(last_decision.humidity_delta - 7.0) < 0.01
 
 
 def test_sibling_shower_gets_fresh_baseline_after_resume():
@@ -1001,8 +1072,9 @@ def test_sibling_shower_gets_fresh_baseline_after_resume():
         )
     )
 
-    # Kid A showers: humidity rises close to (but under) the cut threshold.
-    for state in ("75.0", "88.0"):
+    # Seed the baseline near 72, then kid A showers: humidity rises close to
+    # (but under) the cut threshold (delta ~14 < 15).
+    for state in ("72.0", "86.0"):
         event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
         asyncio.run(captured["callback"](event))
     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
@@ -1044,6 +1116,8 @@ def test_duration_fallback_cuts_water_via_wiring_without_presence_sensor():
         )
     )
 
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="70.0")})
+    asyncio.run(captured["callback"](event))
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
     asyncio.run(captured["callback"](event))
 
@@ -1074,6 +1148,8 @@ def test_duration_fallback_still_active_via_wiring_with_presence_sensor():
     )
 
     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="70.0")})
+    asyncio.run(humidity_callback(event))
     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
     asyncio.run(humidity_callback(event))
 
@@ -1091,7 +1167,8 @@ if __name__ == "__main__":
         test_async_setup_uses_custom_max_humidity_delta,
         test_async_setup_uses_custom_max_session_seconds_without_presence_sensor,
         test_presence_sensor_no_longer_disables_duration_fallback,
-        test_async_setup_uses_custom_threshold_and_cooldown,
+        test_async_setup_uses_custom_start_delta_and_cooldown,
+        test_async_setup_uses_custom_baseline_time_constant,
         test_humidity_callback_feeds_detector,
         test_humidity_callback_ignores_unavailable_state,
         test_humidity_callback_ignores_non_numeric_state,

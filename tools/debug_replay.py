@@ -46,14 +46,14 @@ def main():
             readings.append((parse_iso_ts(row["timestamp"]), float(row["humidity"])))
 
     # Configuration values (from user's shower_guard.yaml)
-    humidity_threshold = 75.0
+    humidity_start_delta = 3.0
     cooldown_seconds = 300
     max_humidity_delta = 15.0
     max_session_seconds = None  # presence_sensor configured -> duration fallback disabled
 
     result = replay.replay(
         readings,
-        humidity_threshold=humidity_threshold,
+        humidity_start_delta=humidity_start_delta,
         cooldown_seconds=cooldown_seconds,
         max_humidity_delta=max_humidity_delta,
         max_session_seconds=max_session_seconds,

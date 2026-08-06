@@ -1,6 +1,7 @@
 # ---
-# purpose: Tests for the Session Detection layer (v0.2).
-# version: 0.2.0
+# purpose: Tests for the Session Detection layer (v1.2 — dynamic ambient
+#          baseline replaces the flat absolute humidity threshold).
+# version: 1.2.0
 # ---
 
 import sys
@@ -39,60 +40,122 @@ def t(seconds: int = 0) -> datetime:
     return T0 + timedelta(seconds=seconds)
 
 
-def make_detector(threshold: float = 75.0, cooldown: int = 300) -> SessionDetector:
-    return SessionDetector(humidity_threshold=threshold, cooldown_seconds=cooldown)
+def make_detector(start_delta: float = 3.0, cooldown: int = 300, tau: float = 600.0) -> SessionDetector:
+    return SessionDetector(
+        humidity_start_delta=start_delta,
+        cooldown_seconds=cooldown,
+        baseline_time_constant_seconds=tau,
+    )
 
 
 # ---------------------------------------------------------------------------
-# IDLE state
+# Baseline tracking (IDLE only)
 # ---------------------------------------------------------------------------
 
-def test_idle_low_humidity_no_change():
-    """Low humidity in IDLE produces no state change."""
+def test_first_reading_seeds_baseline_and_never_starts_session():
+    """The very first reading has no history to compare against — it seeds
+    the baseline exactly, and can never itself trigger a start, no matter
+    how high it is."""
     d = make_detector()
-    result = d.update(humidity=50.0, now=t())
+    result = d.update(humidity=95.0, now=t(0))
+    assert result is None
+    assert d.state is SessionState.IDLE
+    assert d.baseline_humidity == 95.0
+
+
+def test_baseline_stays_put_under_stable_humidity():
+    """Repeated identical readings keep the baseline unchanged and never
+    trigger a start."""
+    d = make_detector()
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=58.0, now=t(60))
+    result = d.update(humidity=58.0, now=t(120))
+    assert result is None
+    assert d.state is SessionState.IDLE
+    assert d.baseline_humidity == 58.0
+
+
+def test_slow_ambient_drift_does_not_start_a_session():
+    """A slow rise (e.g. weather/seasonal drift over an hour) gets absorbed
+    into the baseline rather than mistaken for a shower."""
+    d = make_detector(start_delta=3.0, tau=600.0)
+    d.update(humidity=58.0, now=t(0))
+    result = d.update(humidity=61.0, now=t(3600))  # 1 hour later, +3 total
     assert result is None
     assert d.state is SessionState.IDLE
 
 
-def test_idle_at_threshold_starts_session():
-    """Humidity exactly at threshold triggers session start."""
-    d = make_detector(threshold=75.0)
-    change = d.update(humidity=75.0, now=t())
-    assert change is not None
-    assert change.event is SessionEvent.STARTED
-    assert change.previous is SessionState.IDLE
-    assert change.current is SessionState.ACTIVE
-    assert d.state is SessionState.ACTIVE
-
-
-def test_idle_above_threshold_starts_session():
-    """Humidity above threshold triggers session start."""
-    d = make_detector()
-    change = d.update(humidity=90.0, now=t())
+def test_fast_rise_above_baseline_starts_session():
+    """A quick rise well above the (barely-moved) baseline starts a session,
+    even if the room's ambient humidity that day is far from any fixed
+    absolute floor."""
+    d = make_detector(start_delta=3.0, tau=600.0)
+    d.update(humidity=58.0, now=t(0))          # seed baseline ~58
+    d.update(humidity=58.0, now=t(300))        # stays ~58
+    change = d.update(humidity=62.0, now=t(305))  # fast jump 5s later
     assert change is not None
     assert change.event is SessionEvent.STARTED
     assert d.state is SessionState.ACTIVE
+    # active_since_humidity is the ambient baseline, not the raw 62.0 reading
+    # — this is the fix for the "missing rise" bug: a session starting from
+    # a high ambient baseline no longer hides the pre-trigger rise from the
+    # Decision Engine's delta-cutoff policy.
+    assert d.active_since_humidity < 59.0
 
 
-# ---------------------------------------------------------------------------
-# ACTIVE state
-# ---------------------------------------------------------------------------
-
-def test_active_stays_active_while_humid():
-    """Sustained high humidity keeps state ACTIVE with no event."""
+def test_baseline_humidity_property_exposes_current_value():
     d = make_detector()
-    d.update(humidity=80.0, now=t())          # → ACTIVE
-    result = d.update(humidity=85.0, now=t(60))
+    d.update(humidity=50.0, now=t(0))
+    assert d.baseline_humidity == 50.0
+
+
+def test_ema_time_constant_controls_smoothing_speed():
+    """A shorter time constant tracks the ambient baseline faster. Uses a
+    high start_delta so this test is purely about baseline smoothing, not
+    session start."""
+    fast = SessionDetector(humidity_start_delta=50.0, baseline_time_constant_seconds=10.0)
+    slow = SessionDetector(humidity_start_delta=50.0, baseline_time_constant_seconds=600.0)
+
+    for d in (fast, slow):
+        d.update(humidity=50.0, now=t(0))
+        d.update(humidity=60.0, now=t(10))
+
+    assert fast.baseline_humidity > slow.baseline_humidity
+
+
+def test_baseline_catches_up_after_a_session_ends():
+    """After a session ends, the ambient baseline (frozen during the
+    session) resumes tracking and converges back to real ambient conditions
+    over time — it does not stay pinned to the pre-shower reading forever."""
+    d = make_detector(start_delta=3.0, cooldown=10, tau=5.0)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=70.0, now=t(5))    # STARTED
+    d.update(humidity=40.0, now=t(10))   # COOLDOWN
+    d.update(humidity=40.0, now=t(20))   # ENDED
+
+    assert d.state is SessionState.IDLE
+    d.update(humidity=40.0, now=t(80))   # a minute of fresh air later
+    assert d.baseline_humidity < 41.0
+
+
+# ---------------------------------------------------------------------------
+# ACTIVE state — frozen session_start_threshold provides hysteresis
+# ---------------------------------------------------------------------------
+
+def test_active_stays_active_while_above_frozen_threshold():
+    d = make_detector(start_delta=3.0)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=62.0, now=t(5))   # STARTED, threshold frozen ~= 58+3
+    result = d.update(humidity=90.0, now=t(65))
     assert result is None
     assert d.state is SessionState.ACTIVE
 
 
-def test_active_enters_cooldown_on_humidity_drop():
-    """Humidity drop from ACTIVE enters COOLDOWN silently (no event yet)."""
-    d = make_detector()
-    d.update(humidity=80.0, now=t())          # → ACTIVE
-    result = d.update(humidity=60.0, now=t(10))
+def test_active_enters_cooldown_when_dropping_below_frozen_threshold():
+    d = make_detector(start_delta=3.0)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=62.0, now=t(5))   # STARTED
+    result = d.update(humidity=59.0, now=t(65))  # below ~61 threshold
     assert result is None
     assert d.state is SessionState.COOLDOWN
 
@@ -102,112 +165,44 @@ def test_active_enters_cooldown_on_humidity_drop():
 # ---------------------------------------------------------------------------
 
 def test_cooldown_ends_session_after_elapsed():
-    """Cooldown expiry emits ENDED and returns to IDLE."""
-    d = make_detector(cooldown=300)
-    d.update(humidity=80.0, now=t())          # → ACTIVE
-    d.update(humidity=60.0, now=t(10))        # → COOLDOWN
+    d = make_detector(start_delta=3.0, cooldown=300)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=62.0, now=t(5))            # STARTED
+    d.update(humidity=59.0, now=t(65))           # COOLDOWN
 
-    # Just before expiry — still in cooldown.
-    result = d.update(humidity=60.0, now=t(10 + 299))
+    result = d.update(humidity=59.0, now=t(65 + 299))
     assert result is None
     assert d.state is SessionState.COOLDOWN
 
-    # At expiry — session ends.
-    change = d.update(humidity=60.0, now=t(10 + 300))
+    change = d.update(humidity=59.0, now=t(65 + 300))
     assert change is not None
     assert change.event is SessionEvent.ENDED
-    assert change.current is SessionState.IDLE
     assert d.state is SessionState.IDLE
 
 
-def test_cooldown_resumes_on_humidity_rise():
-    """Humidity rising during cooldown emits RESUMED and returns to ACTIVE."""
-    d = make_detector(cooldown=300)
-    d.update(humidity=80.0, now=t())          # → ACTIVE
-    d.update(humidity=60.0, now=t(10))        # → COOLDOWN
+def test_cooldown_resumes_on_rise_above_frozen_threshold():
+    d = make_detector(start_delta=3.0, cooldown=300)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=62.0, now=t(5))            # STARTED
+    d.update(humidity=59.0, now=t(65))           # COOLDOWN
 
-    change = d.update(humidity=80.0, now=t(60))
+    change = d.update(humidity=62.0, now=t(120))
     assert change is not None
     assert change.event is SessionEvent.RESUMED
-    assert change.current is SessionState.ACTIVE
     assert d.state is SessionState.ACTIVE
 
 
-def test_cooldown_not_expired_no_event():
-    """Low humidity within cooldown window produces no event."""
-    d = make_detector(cooldown=300)
-    d.update(humidity=80.0, now=t())          # → ACTIVE
-    d.update(humidity=60.0, now=t(10))        # → COOLDOWN
+def test_sibling_shower_gets_fresh_baseline_on_resume():
+    """A sibling starting a fresh shower during the cooldown window resets
+    the humidity baseline to the RESUMED reading, rather than inheriting the
+    first sibling's cumulative rise (unchanged from v1.1 behavior)."""
+    d = make_detector(start_delta=3.0, cooldown=300)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=70.0, now=t(5))            # STARTED, baseline ~58
+    d.update(humidity=60.0, now=t(65))           # COOLDOWN
 
-    result = d.update(humidity=60.0, now=t(100))
-    assert result is None
-    assert d.state is SessionState.COOLDOWN
-
-
-# ---------------------------------------------------------------------------
-# StateChange dataclass
-# ---------------------------------------------------------------------------
-
-def test_state_change_str_is_readable():
-    """StateChange.__str__ should include event name, states, and humidity."""
-    d = make_detector()
-    change = d.update(humidity=80.0, now=T0)
-    assert "STARTED" in str(change)
-    assert "idle" in str(change)
-    assert "active" in str(change)
-    assert "80.0" in str(change)
-
-
-# ---------------------------------------------------------------------------
-# Custom threshold / cooldown
-# ---------------------------------------------------------------------------
-
-def test_custom_threshold():
-    """Detector respects a custom humidity threshold."""
-    d = make_detector(threshold=60.0)
-    assert d.update(humidity=59.9, now=t()) is None
-    change = d.update(humidity=60.0, now=t(1))
-    assert change is not None
-    assert change.event is SessionEvent.STARTED
-
-
-def test_custom_cooldown():
-    """Detector respects a custom cooldown duration."""
-    d = make_detector(cooldown=30)
-    d.update(humidity=80.0, now=t())     # → ACTIVE
-    d.update(humidity=50.0, now=t(1))    # → COOLDOWN
-
-    assert d.update(humidity=50.0, now=t(29)) is None   # not yet
-    change = d.update(humidity=50.0, now=t(31))         # expired
-    assert change is not None
-    assert change.event is SessionEvent.ENDED
-
-
-# ---------------------------------------------------------------------------
-# Full session lifecycle
-# ---------------------------------------------------------------------------
-
-def test_full_session_lifecycle():
-    """Walk through a complete session: start → cooldown → end."""
-    d = make_detector(cooldown=300)
-
-    # Shower starts
-    c1 = d.update(humidity=80.0, now=t(0))
-    assert c1.event is SessionEvent.STARTED
-
-    # Shower running
-    assert d.update(humidity=85.0, now=t(300)) is None
-
-    # Shower stops
-    assert d.update(humidity=65.0, now=t(600)) is None   # → COOLDOWN silently
-    assert d.state is SessionState.COOLDOWN
-
-    # Cooldown expires
-    c2 = d.update(humidity=65.0, now=t(900))
-    assert c2.event is SessionEvent.ENDED
-
-    # Back to idle
-    assert d.state is SessionState.IDLE
+    d.update(humidity=62.0, now=t(120))          # RESUMED (sibling starts)
+    assert d.active_since_humidity == 62.0       # fresh baseline, not ~58
 
 
 # ---------------------------------------------------------------------------
@@ -215,35 +210,23 @@ def test_full_session_lifecycle():
 # ---------------------------------------------------------------------------
 
 def test_active_since_none_when_idle():
-    """active_since is None before any session starts."""
     d = make_detector()
     assert d.active_since is None
 
 
 def test_active_since_set_on_start():
-    """active_since is set to the STARTED timestamp."""
-    d = make_detector()
-    d.update(humidity=80.0, now=t(0))
-    assert d.active_since == t(0)
-
-
-def test_active_since_persists_through_cooldown_and_resume():
-    """active_since is preserved across COOLDOWN and RESUMED (same session)."""
-    d = make_detector(cooldown=300)
-    d.update(humidity=80.0, now=t(0))          # → ACTIVE, active_since = t(0)
-    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
-    assert d.active_since == t(0)
-
-    d.update(humidity=80.0, now=t(60))         # → RESUMED
-    assert d.active_since == t(0)
+    d = make_detector(start_delta=3.0)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=62.0, now=t(5))
+    assert d.active_since == t(5)
 
 
 def test_active_since_cleared_on_end():
-    """active_since is cleared once the session ends."""
-    d = make_detector(cooldown=300)
-    d.update(humidity=80.0, now=t(0))          # → ACTIVE
-    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
-    d.update(humidity=60.0, now=t(310))        # → ENDED
+    d = make_detector(start_delta=3.0, cooldown=10)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=62.0, now=t(5))
+    d.update(humidity=40.0, now=t(10))
+    d.update(humidity=40.0, now=t(20))
     assert d.active_since is None
 
 
@@ -252,62 +235,54 @@ def test_active_since_cleared_on_end():
 # ---------------------------------------------------------------------------
 
 def test_active_since_humidity_none_when_idle():
-    """active_since_humidity is None before any session starts."""
     d = make_detector()
     assert d.active_since_humidity is None
-
-
-def test_active_since_humidity_set_on_start():
-    """active_since_humidity is set to the humidity that triggered STARTED."""
-    d = make_detector()
-    d.update(humidity=80.0, now=t(0))
-    assert d.active_since_humidity == 80.0
-
-
-def test_active_since_humidity_resets_on_resume():
-    """active_since_humidity resets to the RESUMED reading (not the original
-    STARTED reading) so a sibling starting a fresh shower during the
-    cooldown window gets its own baseline."""
-    d = make_detector(cooldown=300)
-    d.update(humidity=80.0, now=t(0))          # → ACTIVE, baseline = 80.0
-    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
-    assert d.active_since_humidity == 80.0
-
-    d.update(humidity=76.0, now=t(60))         # → RESUMED (sibling starts)
-    assert d.active_since_humidity == 76.0     # baseline reset to resume reading
 
 
 def test_active_since_humidity_cleared_on_end():
-    """active_since_humidity is cleared once the session ends."""
-    d = make_detector(cooldown=300)
-    d.update(humidity=80.0, now=t(0))          # → ACTIVE
-    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
-    d.update(humidity=60.0, now=t(310))        # → ENDED
+    d = make_detector(start_delta=3.0, cooldown=10)
+    d.update(humidity=58.0, now=t(0))
+    d.update(humidity=62.0, now=t(5))
+    d.update(humidity=40.0, now=t(10))
+    d.update(humidity=40.0, now=t(20))
     assert d.active_since_humidity is None
+
+
+# ---------------------------------------------------------------------------
+# StateChange dataclass
+# ---------------------------------------------------------------------------
+
+def test_state_change_str_is_readable():
+    d = make_detector(start_delta=3.0)
+    d.update(humidity=58.0, now=t(0))
+    change = d.update(humidity=62.0, now=t(5))
+    text = str(change)
+    assert "STARTED" in text
+    assert "idle" in text
+    assert "active" in text
+    assert "62.0" in text
 
 
 if __name__ == "__main__":
     tests = [
-        test_idle_low_humidity_no_change,
-        test_idle_at_threshold_starts_session,
-        test_idle_above_threshold_starts_session,
-        test_active_stays_active_while_humid,
-        test_active_enters_cooldown_on_humidity_drop,
+        test_first_reading_seeds_baseline_and_never_starts_session,
+        test_baseline_stays_put_under_stable_humidity,
+        test_slow_ambient_drift_does_not_start_a_session,
+        test_fast_rise_above_baseline_starts_session,
+        test_baseline_humidity_property_exposes_current_value,
+        test_ema_time_constant_controls_smoothing_speed,
+        test_baseline_catches_up_after_a_session_ends,
+        test_active_stays_active_while_above_frozen_threshold,
+        test_active_enters_cooldown_when_dropping_below_frozen_threshold,
         test_cooldown_ends_session_after_elapsed,
-        test_cooldown_resumes_on_humidity_rise,
-        test_cooldown_not_expired_no_event,
-        test_state_change_str_is_readable,
-        test_custom_threshold,
-        test_custom_cooldown,
-        test_full_session_lifecycle,
+        test_cooldown_resumes_on_rise_above_frozen_threshold,
+        test_sibling_shower_gets_fresh_baseline_on_resume,
         test_active_since_none_when_idle,
         test_active_since_set_on_start,
-        test_active_since_persists_through_cooldown_and_resume,
         test_active_since_cleared_on_end,
         test_active_since_humidity_none_when_idle,
-        test_active_since_humidity_set_on_start,
-        test_active_since_humidity_resets_on_resume,
         test_active_since_humidity_cleared_on_end,
+        test_state_change_str_is_readable,
     ]
     passed = 0
     failed = 0

@@ -18,9 +18,10 @@ from datetime import datetime
 from typing import Iterable, List, Optional, Tuple
 
 from .const import (
+    DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DECISION_LOG_SIZE,
-    DEFAULT_HUMIDITY_THRESHOLD,
+    DEFAULT_HUMIDITY_START_DELTA,
     DEFAULT_MAX_HUMIDITY_DELTA,
     DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
 )
@@ -41,8 +42,9 @@ class ReplayResult:
 def replay(
     readings: Iterable[Reading],
     *,
-    humidity_threshold: float = DEFAULT_HUMIDITY_THRESHOLD,
+    humidity_start_delta: float = DEFAULT_HUMIDITY_START_DELTA,
     cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+    baseline_time_constant_seconds: float = DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
     max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
     max_session_seconds: Optional[float] = None,
     presence_confirmation_window_seconds: float = DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
@@ -66,7 +68,9 @@ def replay(
     sorted oldest-first; they don't need matching timestamps or lengths.
     """
     detector = SessionDetector(
-        humidity_threshold=humidity_threshold, cooldown_seconds=cooldown_seconds
+        humidity_start_delta=humidity_start_delta,
+        cooldown_seconds=cooldown_seconds,
+        baseline_time_constant_seconds=baseline_time_constant_seconds,
     )
     engine = DecisionEngine(
         max_humidity_delta=max_humidity_delta,
@@ -163,10 +167,15 @@ def _main() -> None:
         help="Optional CSV file with 'timestamp,presence' columns (on/off).",
     )
     parser.add_argument(
-        "--humidity-threshold", type=float, default=DEFAULT_HUMIDITY_THRESHOLD
+        "--humidity-start-delta", type=float, default=DEFAULT_HUMIDITY_START_DELTA
     )
     parser.add_argument(
         "--cooldown-seconds", type=int, default=DEFAULT_COOLDOWN_SECONDS
+    )
+    parser.add_argument(
+        "--baseline-time-constant-seconds",
+        type=float,
+        default=DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
     )
     parser.add_argument(
         "--max-humidity-delta", type=float, default=DEFAULT_MAX_HUMIDITY_DELTA
@@ -190,8 +199,9 @@ def _main() -> None:
     )
     result = replay(
         readings,
-        humidity_threshold=args.humidity_threshold,
+        humidity_start_delta=args.humidity_start_delta,
         cooldown_seconds=args.cooldown_seconds,
+        baseline_time_constant_seconds=args.baseline_time_constant_seconds,
         max_humidity_delta=args.max_humidity_delta,
         max_session_seconds=args.max_session_seconds,
         presence_confirmation_window_seconds=args.presence_confirmation_window_seconds,

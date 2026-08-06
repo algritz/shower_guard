@@ -1,23 +1,38 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 1.4.0
+# version: 1.5.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
-# Session Detection
-# Humidity level (% RH) that triggers session start.
-DEFAULT_HUMIDITY_THRESHOLD: float = 75.0
+# Session Detection (v1.5, ADR-0004)
+# Session start is relative to a tracked ambient baseline, not a flat
+# absolute value: a session begins once humidity has risen this many points
+# above the baseline. Replaces the old flat DEFAULT_HUMIDITY_THRESHOLD, which
+# under-detected sessions starting from a high ambient baseline — e.g. a
+# session starting at 58% wasn't detected until it crossed a flat 75% floor,
+# hiding ~17 points of real rise from the Decision Engine's humidity-delta
+# policy (which measures rise from the session-start baseline).
+DEFAULT_HUMIDITY_START_DELTA: float = 3.0
+CONF_HUMIDITY_START_DELTA = "humidity_start_delta"
 
-# How long (seconds) humidity must stay below the threshold before a session
-# is considered ended. Prevents false endings from brief dips.
+# Time constant (seconds) for the ambient-baseline EMA, tracked only while
+# IDLE and frozen the instant a session starts. Large enough that the
+# shower's own fast rise can't drag the baseline upward mid-session (it's
+# frozen anyway once ACTIVE), but responsive enough to track genuine ambient
+# drift (season, weather, ventilation) over the hours between showers.
+DEFAULT_BASELINE_TIME_CONSTANT_SECONDS: float = 600.0  # 10 minutes
+CONF_BASELINE_TIME_CONSTANT_SECONDS = "baseline_time_constant_seconds"
+
+# How long (seconds) humidity must stay below the session's frozen start
+# threshold before a session is considered ended. Prevents false endings
+# from brief dips. (Hysteresis behavior only — not a trigger level.)
 DEFAULT_COOLDOWN_SECONDS: int = 300  # 5 minutes
 
 # configuration.yaml keys (Sensor Layer wiring)
 CONF_HUMIDITY_SENSOR = "humidity_sensor"
-CONF_HUMIDITY_THRESHOLD = "humidity_threshold"
 CONF_COOLDOWN_SECONDS = "cooldown_seconds"
 
 # Decision Engine (see ADR-0001)
@@ -83,3 +98,11 @@ ENTITY_ID_HUMIDITY_DELTA = f"sensor.{DOMAIN}_humidity_delta"
 # above is measured from. Published alongside the delta for the same reason:
 # so a dashboard can show it without any YAML/template re-tracking it.
 ENTITY_ID_SESSION_BASELINE_HUMIDITY = f"sensor.{DOMAIN}_baseline_humidity"
+
+# Whether a shower session is currently active (ACTIVE or COOLDOWN), published
+# the same way as the two entities above (v1.5). Session start is no longer a
+# static number a template sensor can compare against (it's the stateful
+# ambient baseline in session.py), so this entity replaces the packaged
+# YAML's own hardcoded threshold comparison — the packaged YAML should read
+# this entity rather than re-deriving session state itself.
+ENTITY_ID_SESSION_ACTIVE = f"binary_sensor.{DOMAIN}_session_active"

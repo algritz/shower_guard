@@ -10,7 +10,9 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 ```
 
 - **Sensor Layer** — Reads humidity and presence sensors from Home Assistant.
-- **Session Detection** — Determines when a shower session starts and ends.
+- **Session Detection** — Determines when a shower session starts and ends,
+  using a dynamic ambient-humidity baseline rather than a flat threshold
+  (v1.5, ADR-0004).
 - **Decision Engine** — Decides whether water should remain available. Actuator-agnostic.
 - **Actuator** — Abstracted via HA scripts. Two deployment targets:
   - Apartment: smart plug controlling a pump.
@@ -31,6 +33,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 | v1.2    | Live Humidity Delta Entity | ✅ Done |
 | v1.3    | Live Baseline Humidity Entity | ✅ Done |
 | v1.4    | Presence Confirmation Gate (ADR-0003) | ✅ Done |
+| v1.5    | Dynamic Baseline Session Start (ADR-0004) | ✅ Done |
 
 ## Installation
 
@@ -38,13 +41,14 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 2. Restart Home Assistant.
 3. Configure via `configuration.yaml` (see below).
 
-## Configuration (v1.4)
+## Configuration (v1.5)
 
 ```yaml
 shower_guard:
   humidity_sensor: sensor.bathroom_humidity           # required — entity providing % RH
   presence_sensor: binary_sensor.bathroom_presence    # optional — 'on'/'off' presence entity
-  humidity_threshold: 75.0                            # optional — default 75.0
+  humidity_start_delta: 3.0                           # optional — default 3.0 (points above ambient baseline that trigger a session)
+  baseline_time_constant_seconds: 600                 # optional — default 600 (10 min EMA time constant for the ambient baseline)
   cooldown_seconds: 300                               # optional — default 300 (5 min)
   max_humidity_delta: 15.0                             # optional — default 15.0 (percentage points RH)
   presence_confirmation_window_seconds: 60             # optional — default 60s (see ADR-0003)
@@ -63,16 +67,32 @@ Home Assistant log. On every decision **change**, the corresponding HA script
 `script.turn_on` service, per ADR-0001 (actuator abstraction via scripts only;
 the Decision Engine itself never references a script or device).
 
+**Dynamic baseline session start (v1.5, ADR-0004):** a session starts once
+humidity has risen `humidity_start_delta` points above a continuously-tracked
+ambient baseline — not once it crosses a fixed absolute floor. The baseline
+is a time-based EMA (smoothed over `baseline_time_constant_seconds`) tracked
+only while idle, and is frozen the instant a session starts. This replaces
+the old flat `humidity_threshold`: a bathroom's ambient humidity varies by
+season and ventilation, and a flat floor either under-detects (baseline high,
+floor crossed late — hiding real pre-crossing rise from the delta-cutoff
+policy below) or over-detects (baseline low, floor crossed on a minor
+fluctuation) depending on the day. See ADR-0004 for the full rationale,
+including the real-world case that motivated it. Note: a session's
+very-first-ever humidity reading only seeds the baseline — it can never
+itself trigger a start.
+
 **Humidity-delta cutoff (v1.1, gated by presence as of v1.4 — see ADR-0003):**
 water is cut once humidity has risen `max_humidity_delta` percentage points
-above the current baseline **and** presence has been confirmed within
-`presence_confirmation_window_seconds` — not on delta alone. The baseline is
-the reading at session start, and **resets on each `RESUMED` event**
-(humidity rising again during the `cooldown_seconds` window) so a sibling
-starting a fresh shower right after the first gets their own baseline
-instead of inheriting the previous person's cumulative rise. Without a
-`presence_sensor` configured at all, delta alone never cuts water — see
-Presence Sensor below.
+above the session-start baseline **and** presence has been confirmed within
+`presence_confirmation_window_seconds` — not on delta alone. As of v1.5, that
+baseline is the true ambient reading tracked before the session started (see
+above), not the raw reading that happened to cross the old flat threshold —
+so this policy now sees the session's full rise. The baseline **resets on
+each `RESUMED` event** (humidity rising again during the `cooldown_seconds`
+window) so a sibling starting a fresh shower right after the first gets their
+own baseline instead of inheriting the previous person's cumulative rise.
+Without a `presence_sensor` configured at all, delta alone never cuts water —
+see Presence Sensor below.
 
 **Duration fallback (optional, independent of presence — ADR-0003):**
 `max_session_seconds` is off unless explicitly configured, regardless of
@@ -105,18 +125,20 @@ changes — is recorded into a bounded, in-memory `DecisionLog`
 audit trail for troubleshooting and a foundation the Replay Engine (v0.5) can
 build on.
 
-## Replay Engine (v0.5; presence support added v1.4 — ADR-0003)
+## Replay Engine (v0.5; presence support added v1.4 — ADR-0003; start-delta
+## params updated v1.5 — ADR-0004)
 
 Replay recorded or synthetic humidity (and optionally presence) readings
 through the **exact same** `SessionDetector` and `DecisionEngine` classes
 used in production — no decision logic is duplicated. Useful for validating
-threshold/delta/presence-window tuning against historical data, entirely
+start-delta/delta/presence-window tuning against historical data, entirely
 outside Home Assistant.
 
 ```bash
 python -m custom_components.shower_guard.replay readings.csv \
   --presence-csv presence.csv \
-  --humidity-threshold 75.0 \
+  --humidity-start-delta 3.0 \
+  --baseline-time-constant-seconds 600 \
   --cooldown-seconds 300 \
   --max-humidity-delta 15.0 \
   --presence-confirmation-window-seconds 60 \

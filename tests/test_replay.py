@@ -117,15 +117,23 @@ def test_replay_duration_fallback_disabled_by_default():
 
 
 def test_replay_duration_fallback_cuts_water_when_enabled():
-    readings = [(t(0), 75.0), (t(900), 77.0)]
-    result = replay(readings, max_humidity_delta=15.0, max_session_seconds=900)
+    """A session starts quickly (seed + fast rise), then a long low-delta
+    stretch trips the duration fallback rather than the delta policy."""
+    readings = [
+        (t(0), 58.0),    # seed baseline
+        (t(5), 70.0),    # fast rise -> session starts
+        (t(905), 72.0),  # 900s after start, delta still small
+    ]
+    result = replay(readings, max_humidity_delta=20.0, max_session_seconds=900)
 
-    assert result.decision_log.last.decision is Decision.WATER_CUT
+    last = result.decision_log.last
+    assert last.decision is Decision.WATER_CUT
+    assert "exceeded max duration" in last.reason.lower()
 
 
-def test_replay_respects_custom_threshold_and_cooldown():
-    readings = [(t(0), 60.0)]  # below default 75.0 threshold
-    result = replay(readings, humidity_threshold=60.0)
+def test_replay_respects_custom_start_delta():
+    readings = [(t(0), 50.0), (t(60), 53.5)]  # below default 3.0 start delta
+    result = replay(readings, humidity_start_delta=2.0)
 
     assert result.state_changes[0].event is SessionEvent.STARTED
 
@@ -164,8 +172,8 @@ def test_csv_readings_can_be_replayed():
     ) as f:
         writer = csv.writer(f)
         writer.writerow(["timestamp", "humidity"])
-        writer.writerow([t(0).isoformat(), "80.0"])
-        writer.writerow([t(900).isoformat(), "85.0"])
+        writer.writerow([t(0).isoformat(), "58.0"])
+        writer.writerow([t(5).isoformat(), "70.0"])
         path = f.name
 
     try:
@@ -186,7 +194,7 @@ if __name__ == "__main__":
         test_replay_presence_confirmation_tolerates_brief_gap,
         test_replay_duration_fallback_disabled_by_default,
         test_replay_duration_fallback_cuts_water_when_enabled,
-        test_replay_respects_custom_threshold_and_cooldown,
+        test_replay_respects_custom_start_delta,
         test_replay_decision_log_respects_size_limit,
         test_load_readings_from_csv,
         test_csv_readings_can_be_replayed,

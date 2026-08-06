@@ -2,7 +2,7 @@
 #
 # Shower Guard
 #
-# Version : 1.1.0
+# Version : 1.5.0
 #
 # Purpose
 # -------
@@ -11,6 +11,13 @@
 #
 # The custom component owns all session detection and decision logic.
 # This package only adds helpers and template sensors that mirror its state.
+#
+# v1.5 (ADR-0004): session start is no longer a flat number a template
+# sensor can compare against (it's now the stateful ambient baseline owned
+# by session.py). The "Session State"/"Session Active" sensors below read
+# binary_sensor.shower_guard_session_active, which the integration itself
+# publishes, instead of re-deriving session state from a hardcoded humidity
+# threshold.
 #
 ###############################################################################
 
@@ -38,6 +45,9 @@ template:
         icon: mdi:shower
         state: >
           {{ states('binary_sensor.shower_guard_session_active') }}
+        # Note: this mirrors the integration's own published entity — see
+        # the binary_sensor below, which is the actual source of truth as
+        # of v1.5 (ADR-0004). Kept for backward-compatible entity naming.
 
       - name: Shower Guard Humidity
         unique_id: shower_guard_humidity
@@ -72,12 +82,16 @@ template:
 
   - binary_sensor:
 
-      - name: Shower Guard Session Active
-        unique_id: shower_guard_session_active
-        device_class: running
-        icon: mdi:shower-head
-        state: >
-              {{ states('sensor.bathroom_third_reality_inc_3rths0224z_humidity') | float(0) >= 75.0 }}
+      # Note: "Shower Guard Session Active" (binary_sensor.shower_guard_
+      # session_active) is intentionally NOT defined here. As of v1.5
+      # (ADR-0004), session start/active is a stateful, dynamic-baseline
+      # computation owned by session.py — there's no flat number a template
+      # sensor can compare against anymore. The integration itself publishes
+      # this entity directly (see __init__.py's _publish_decision_state /
+      # ENTITY_ID_SESSION_ACTIVE in const.py). Re-adding a hardcoded
+      # threshold comparison here would silently drift from the real session
+      # state, exactly the architectural-debt failure mode this project
+      # tries to avoid (see ADR-0001's layer-separation principle).
 
       - name: Shower Guard Presence Detected
         unique_id: shower_guard_presence_detected

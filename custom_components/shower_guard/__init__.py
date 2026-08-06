@@ -25,10 +25,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.event import async_track_state_change_event
 
 from .const import (
+    CONF_BASELINE_TIME_CONSTANT_SECONDS,
     CONF_COOLDOWN_SECONDS,
     CONF_DECISION_LOG_SIZE,
     CONF_HUMIDITY_SENSOR,
-    CONF_HUMIDITY_THRESHOLD,
+    CONF_HUMIDITY_START_DELTA,
     CONF_MAX_HUMIDITY_DELTA,
     CONF_MAX_SESSION_SECONDS,
     CONF_NOTIFY_SERVICE,
@@ -36,19 +37,21 @@ from .const import (
     CONF_PRESENCE_SENSOR,
     CONF_WATER_AVAILABLE_SCRIPT,
     CONF_WATER_CUT_SCRIPT,
+    DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DECISION_LOG_SIZE,
-    DEFAULT_HUMIDITY_THRESHOLD,
+    DEFAULT_HUMIDITY_START_DELTA,
     DEFAULT_MAX_HUMIDITY_DELTA,
     DEFAULT_MAX_SESSION_SECONDS,
     DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
     DOMAIN,
     ENTITY_ID_HUMIDITY_DELTA,
+    ENTITY_ID_SESSION_ACTIVE,
     ENTITY_ID_SESSION_BASELINE_HUMIDITY,
     VERSION,
 )
 from .decision import Decision, DecisionEngine, DecisionLog
-from .session import SessionDetector
+from .session import SessionDetector, SessionState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,11 +84,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         return True
 
     detector = SessionDetector(
-        humidity_threshold=domain_config.get(
-            CONF_HUMIDITY_THRESHOLD, DEFAULT_HUMIDITY_THRESHOLD
+        humidity_start_delta=domain_config.get(
+            CONF_HUMIDITY_START_DELTA, DEFAULT_HUMIDITY_START_DELTA
         ),
         cooldown_seconds=domain_config.get(
             CONF_COOLDOWN_SECONDS, DEFAULT_COOLDOWN_SECONDS
+        ),
+        baseline_time_constant_seconds=domain_config.get(
+            CONF_BASELINE_TIME_CONSTANT_SECONDS, DEFAULT_BASELINE_TIME_CONSTANT_SECONDS
         ),
     )
 
@@ -199,6 +205,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 "unit_of_measurement": "%",
                 "friendly_name": "Shower Guard Baseline Humidity",
                 "icon": "mdi:water-outline",
+            },
+        )
+        hass.states.async_set(
+            ENTITY_ID_SESSION_ACTIVE,
+            "on" if result.session_state is not SessionState.IDLE else "off",
+            {
+                "friendly_name": "Shower Guard Session Active",
+                "device_class": "running",
+                "icon": "mdi:shower-head",
             },
         )
 

@@ -1,0 +1,1553 @@
+diff --git a/BACKLOG.md b/BACKLOG.md
+index b44ac1f..6452e47 100644
+--- a/BACKLOG.md
++++ b/BACKLOG.md
+@@ -1,8 +1,8 @@
+ # Shower Guard — Backlog
+ 
+-Features deferred beyond the current roadmap. All milestones through v1.1
+-(Humidity-Delta Cutoff) are complete — remaining work lives here until
+-scheduled.
++Features deferred beyond the current roadmap. All milestones through v1.5
++(Dynamic Baseline Session Start) are complete — remaining work lives here
++until scheduled.
+ 
+ ---
+ 
+@@ -29,6 +29,25 @@ scheduled.
+   once presence became required to confirm any delta-based cutoff. Kept
+   here as a record of the original gap.
+ 
++### Nonlinear / Starting-Humidity-Dependent `max_humidity_delta`
++- **Reason deferred:** RH is harder to raise further the closer it is to
++  saturation (e.g. 65%→80% likely reflects more sustained steam than
++  50%→60%), so a flat `max_humidity_delta` may be more forgiving to
++  low-starting-baseline bathrooms than high-starting-baseline ones. As of
++  v1.5 (ADR-0004), the delta policy sees the full rise from the true ambient
++  baseline for the first time — making this worth revisiting — but that's
++  motivated by a single logged session, not enough data to fit a formula
++  without risking overfitting to one house, one season, one shower.
++- **Target version:** Revisit once several real sessions (varied starting
++  humidity, varied season) have been captured and run through the Replay
++  Engine.
++- **Notes:** Candidate approaches once data exists: a lookup table keyed by
++  baseline bucket, or a cutoff expressed as a fraction of remaining headroom
++  to saturation rather than a flat point value. Any change here is scoped to
++  `decision.py`/`const.py` only — orthogonal to ADR-0004's session-start
++  change and to ADR-0003's presence-confirmation gate, both of which stay as
++  they are.
++
+ ---
+ 
+ ## Format
+diff --git a/README.md b/README.md
+index e31fa31..15e6a96 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,9 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ ```
+ 
+ - **Sensor Layer** — Reads humidity and presence sensors from Home Assistant.
+-- **Session Detection** — Determines when a shower session starts and ends.
++- **Session Detection** — Determines when a shower session starts and ends,
++  using a dynamic ambient-humidity baseline rather than a flat threshold
++  (v1.5, ADR-0004).
+ - **Decision Engine** — Decides whether water should remain available. Actuator-agnostic.
+ - **Actuator** — Abstracted via HA scripts. Two deployment targets:
+   - Apartment: smart plug controlling a pump.
+@@ -31,6 +33,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ | v1.2    | Live Humidity Delta Entity | ✅ Done |
+ | v1.3    | Live Baseline Humidity Entity | ✅ Done |
+ | v1.4    | Presence Confirmation Gate (ADR-0003) | ✅ Done |
++| v1.5    | Dynamic Baseline Session Start (ADR-0004) | ✅ Done |
+ 
+ ## Installation
+ 
+@@ -38,13 +41,14 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ 2. Restart Home Assistant.
+ 3. Configure via `configuration.yaml` (see below).
+ 
+-## Configuration (v1.4)
++## Configuration (v1.5)
+ 
+ ```yaml
+ shower_guard:
+   humidity_sensor: sensor.bathroom_humidity           # required — entity providing % RH
+   presence_sensor: binary_sensor.bathroom_presence    # optional — 'on'/'off' presence entity
+-  humidity_threshold: 75.0                            # optional — default 75.0
++  humidity_start_delta: 3.0                           # optional — default 3.0 (points above ambient baseline that trigger a session)
++  baseline_time_constant_seconds: 600                 # optional — default 600 (10 min EMA time constant for the ambient baseline)
+   cooldown_seconds: 300                               # optional — default 300 (5 min)
+   max_humidity_delta: 15.0                             # optional — default 15.0 (percentage points RH)
+   presence_confirmation_window_seconds: 60             # optional — default 60s (see ADR-0003)
+@@ -63,16 +67,32 @@ Home Assistant log. On every decision **change**, the corresponding HA script
+ `script.turn_on` service, per ADR-0001 (actuator abstraction via scripts only;
+ the Decision Engine itself never references a script or device).
+ 
++**Dynamic baseline session start (v1.5, ADR-0004):** a session starts once
++humidity has risen `humidity_start_delta` points above a continuously-tracked
++ambient baseline — not once it crosses a fixed absolute floor. The baseline
++is a time-based EMA (smoothed over `baseline_time_constant_seconds`) tracked
++only while idle, and is frozen the instant a session starts. This replaces
++the old flat `humidity_threshold`: a bathroom's ambient humidity varies by
++season and ventilation, and a flat floor either under-detects (baseline high,
++floor crossed late — hiding real pre-crossing rise from the delta-cutoff
++policy below) or over-detects (baseline low, floor crossed on a minor
++fluctuation) depending on the day. See ADR-0004 for the full rationale,
++including the real-world case that motivated it. Note: a session's
++very-first-ever humidity reading only seeds the baseline — it can never
++itself trigger a start.
++
+ **Humidity-delta cutoff (v1.1, gated by presence as of v1.4 — see ADR-0003):**
+ water is cut once humidity has risen `max_humidity_delta` percentage points
+-above the current baseline **and** presence has been confirmed within
+-`presence_confirmation_window_seconds` — not on delta alone. The baseline is
+-the reading at session start, and **resets on each `RESUMED` event**
+-(humidity rising again during the `cooldown_seconds` window) so a sibling
+-starting a fresh shower right after the first gets their own baseline
+-instead of inheriting the previous person's cumulative rise. Without a
+-`presence_sensor` configured at all, delta alone never cuts water — see
+-Presence Sensor below.
++above the session-start baseline **and** presence has been confirmed within
++`presence_confirmation_window_seconds` — not on delta alone. As of v1.5, that
++baseline is the true ambient reading tracked before the session started (see
++above), not the raw reading that happened to cross the old flat threshold —
++so this policy now sees the session's full rise. The baseline **resets on
++each `RESUMED` event** (humidity rising again during the `cooldown_seconds`
++window) so a sibling starting a fresh shower right after the first gets their
++own baseline instead of inheriting the previous person's cumulative rise.
++Without a `presence_sensor` configured at all, delta alone never cuts water —
++see Presence Sensor below.
+ 
+ **Duration fallback (optional, independent of presence — ADR-0003):**
+ `max_session_seconds` is off unless explicitly configured, regardless of
+@@ -105,18 +125,20 @@ changes — is recorded into a bounded, in-memory `DecisionLog`
+ audit trail for troubleshooting and a foundation the Replay Engine (v0.5) can
+ build on.
+ 
+-## Replay Engine (v0.5; presence support added v1.4 — ADR-0003)
++## Replay Engine (v0.5; presence support added v1.4 — ADR-0003; start-delta
++## params updated v1.5 — ADR-0004)
+ 
+ Replay recorded or synthetic humidity (and optionally presence) readings
+ through the **exact same** `SessionDetector` and `DecisionEngine` classes
+ used in production — no decision logic is duplicated. Useful for validating
+-threshold/delta/presence-window tuning against historical data, entirely
++start-delta/delta/presence-window tuning against historical data, entirely
+ outside Home Assistant.
+ 
+ ```bash
+ python -m custom_components.shower_guard.replay readings.csv \
+   --presence-csv presence.csv \
+-  --humidity-threshold 75.0 \
++  --humidity-start-delta 3.0 \
++  --baseline-time-constant-seconds 600 \
+   --cooldown-seconds 300 \
+   --max-humidity-delta 15.0 \
+   --presence-confirmation-window-seconds 60 \
+diff --git a/adr/ADR-0004-dynamic-baseline-session-start.md b/adr/ADR-0004-dynamic-baseline-session-start.md
+new file mode 100644
+index 0000000..355edab
+--- /dev/null
++++ b/adr/ADR-0004-dynamic-baseline-session-start.md
+@@ -0,0 +1,106 @@
++# ADR-0004 — Dynamic Ambient Baseline Replaces the Flat Session-Start Threshold
++
++| Field     | Value                    |
++|-----------|--------------------------|
++| Status    | Accepted                 |
++| Date      | 2026-08-06               |
++| Author    | Technical Lead           |
++
++---
++
++## Context
++
++Since v0.2, `SessionDetector` has used a single flat absolute value,
++`humidity_threshold` (default 75.0% RH): a session started the instant a
++reading crossed that floor. ADR-0003 changed *what* it takes to cut water
++during a session (presence must confirm a delta-exceeded cutoff), but never
++touched *how* a session is detected as having started in the first place —
++that logic is unchanged since v0.2.
++
++Real-world logging surfaced a case where a shower's ambient starting
++humidity was ~58%. The flat threshold didn't fire until humidity crossed
++75% — several minutes and roughly 18 points of real rise into the shower.
++Because `active_since_humidity` (the baseline `DecisionEngine`'s delta
++policy measures rise from) is captured at the moment of that crossing, all
++~18 points of pre-crossing rise were invisible to the delta policy. The
++effective tolerated rise before a cutoff was therefore `max_humidity_delta`
++*plus* however much rise happened to occur before the flat floor was
++crossed — silently and unpredictably looser than the configured value, and
++worse the higher the room's ambient humidity that day.
++
++A flat floor also doesn't adapt to conditions: a bathroom that runs warm and
++humid in summer reaches 75% far sooner than one in a dry winter house, even
++with identical shower behavior. This is a distinct problem from the one
++ADR-0003 solved — that ADR is about whether an already-exceeded delta is
++trustworthy enough to cut; this one is about whether the delta itself is
++being measured from the right starting point.
++
++## Decision
++
++Session start is now relative to a tracked **ambient baseline** instead of a
++fixed absolute value:
++
++- While `IDLE`, `SessionDetector` maintains a time-based exponential moving
++  average (EMA) of humidity — the ambient baseline. The EMA is time-based
++  (not sample-based) so irregular sensor push intervals don't distort the
++  smoothing.
++- A session starts once a reading is `humidity_start_delta` points (default
++  3.0) above that baseline.
++- The baseline is **frozen** the instant a session starts, and
++  `active_since_humidity` is set to that frozen baseline value — not the raw
++  reading that crossed the trigger. This is the actual fix: `DecisionEngine`'s
++  delta-cutoff policy (and, downstream of ADR-0003, the presence-confirmation
++  gate on that policy) now sees the full rise from true ambient conditions,
++  not just the portion after an arbitrary floor was crossed.
++- The frozen threshold (`baseline + humidity_start_delta` at start time) is
++  reused for the existing ACTIVE→COOLDOWN/COOLDOWN→ACTIVE hysteresis, exactly
++  as the old flat threshold was — only the *start* trigger became relative.
++- The baseline resumes tracking (via the same EMA) once a session ends,
++  rather than requiring an explicit reset — it naturally catches back up to
++  real ambient conditions over roughly one time constant.
++- `max_humidity_delta` (ADR-0003's cutoff, presence-gated) is **not**
++  changed by this ADR. The full rise being visible now is a strictly more
++  accurate input to that policy; whether the existing default is still the
++  right tuning is a separate question, tracked in `BACKLOG.md` pending more
++  replayed real-session data.
++- The published `binary_sensor.shower_guard_session_active` entity (new in
++  this ADR) replaces the packaged YAML's own hardcoded `>= 75.0` template
++  sensor, since there's no longer a static number a template can compare
++  against — session state is a stateful computation only `session.py` can
++  produce. This closes the `BACKLOG.md`/dashboard item tracking that
++  duplication as architectural debt.
++
++## Consequences
++
++- A session's first-ever humidity reading can never itself trigger a start —
++  it only seeds the baseline. This is a behavior change from all prior
++  versions (where a single reading at/above 75% started a session
++  immediately); test suites were updated accordingly.
++- `SessionDetector`'s constructor and public config surface changed:
++  `humidity_threshold` → `humidity_start_delta`, plus a new
++  `baseline_time_constant_seconds`. This is a breaking config change — any
++  live `configuration.yaml` referencing the old key must be updated by hand;
++  this ADR does not migrate live HA configuration. `replay.py`'s CLI flag
++  changed the same way (`--humidity-threshold` → `--humidity-start-delta`).
++- `decision.py` is untouched — this ADR is scoped entirely to Session
++  Detection's start trigger, consistent with ADR-0001's layer separation.
++  ADR-0003's presence-confirmation gate behaves identically; it simply now
++  receives a more accurate `active_since_humidity`.
++- A starting-humidity-dependent (nonlinear) scaling of `max_humidity_delta`
++  was discussed but explicitly deferred — see `BACKLOG.md`. One real session
++  isn't enough data to justify a formula.
++
++## Alternatives Considered
++
++- **Keep the flat threshold, just lower it** — Rejected. Doesn't generalize
++  across seasons/ambient conditions; a lower flat value would just move the
++  same problem to a different humidity level rather than fixing it.
++- **Require presence AND baseline-rise to start a session** — Considered and
++  rejected. Would make session *detection* depend on a sensor that's
++  optional everywhere else in the pipeline (and, per ADR-0003, presence's
++  role is specifically to gate a cutoff decision, not to gate detection
++  itself). Presence-as-confirmation-gate (ADR-0003) and baseline-relative
++  start (this ADR) are deliberately independent mechanisms addressing
++  different failure modes.
++- **Nonlinear/starting-humidity-dependent delta cutoff** — Rejected for this
++  ADR; deferred to `BACKLOG.md` pending more replayed real-session data.
+diff --git a/custom_components/shower_guard/__init__.py b/custom_components/shower_guard/__init__.py
+index ca5ab67..d897fcf 100644
+--- a/custom_components/shower_guard/__init__.py
++++ b/custom_components/shower_guard/__init__.py
+@@ -25,10 +25,11 @@ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.helpers.event import async_track_state_change_event
+ 
+ from .const import (
++    CONF_BASELINE_TIME_CONSTANT_SECONDS,
+     CONF_COOLDOWN_SECONDS,
+     CONF_DECISION_LOG_SIZE,
+     CONF_HUMIDITY_SENSOR,
+-    CONF_HUMIDITY_THRESHOLD,
++    CONF_HUMIDITY_START_DELTA,
+     CONF_MAX_HUMIDITY_DELTA,
+     CONF_MAX_SESSION_SECONDS,
+     CONF_NOTIFY_SERVICE,
+@@ -36,19 +37,21 @@ from .const import (
+     CONF_PRESENCE_SENSOR,
+     CONF_WATER_AVAILABLE_SCRIPT,
+     CONF_WATER_CUT_SCRIPT,
++    DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+     DEFAULT_COOLDOWN_SECONDS,
+     DEFAULT_DECISION_LOG_SIZE,
+-    DEFAULT_HUMIDITY_THRESHOLD,
++    DEFAULT_HUMIDITY_START_DELTA,
+     DEFAULT_MAX_HUMIDITY_DELTA,
+     DEFAULT_MAX_SESSION_SECONDS,
+     DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+     DOMAIN,
+     ENTITY_ID_HUMIDITY_DELTA,
++    ENTITY_ID_SESSION_ACTIVE,
+     ENTITY_ID_SESSION_BASELINE_HUMIDITY,
+     VERSION,
+ )
+ from .decision import Decision, DecisionEngine, DecisionLog
+-from .session import SessionDetector
++from .session import SessionDetector, SessionState
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
+@@ -81,12 +84,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+         return True
+ 
+     detector = SessionDetector(
+-        humidity_threshold=domain_config.get(
+-            CONF_HUMIDITY_THRESHOLD, DEFAULT_HUMIDITY_THRESHOLD
++        humidity_start_delta=domain_config.get(
++            CONF_HUMIDITY_START_DELTA, DEFAULT_HUMIDITY_START_DELTA
+         ),
+         cooldown_seconds=domain_config.get(
+             CONF_COOLDOWN_SECONDS, DEFAULT_COOLDOWN_SECONDS
+         ),
++        baseline_time_constant_seconds=domain_config.get(
++            CONF_BASELINE_TIME_CONSTANT_SECONDS, DEFAULT_BASELINE_TIME_CONSTANT_SECONDS
++        ),
+     )
+ 
+     presence_sensor = domain_config.get(CONF_PRESENCE_SENSOR)
+@@ -201,6 +207,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+                 "icon": "mdi:water-outline",
+             },
+         )
++        hass.states.async_set(
++            ENTITY_ID_SESSION_ACTIVE,
++            "on" if result.session_state is not SessionState.IDLE else "off",
++            {
++                "friendly_name": "Shower Guard Session Active",
++                "device_class": "running",
++                "icon": "mdi:shower-head",
++            },
++        )
+ 
+     async def _evaluate_and_record(now: datetime) -> None:
+         """Evaluate the Decision Engine, record the result, publish the
+diff --git a/custom_components/shower_guard/const.py b/custom_components/shower_guard/const.py
+index ee00820..ce3f8ff 100644
+--- a/custom_components/shower_guard/const.py
++++ b/custom_components/shower_guard/const.py
+@@ -1,23 +1,38 @@
+ # ---
+ # purpose: Central constants for the Shower Guard integration.
+-# version: 1.4.0
++# version: 1.5.0
+ # note: Add new constants here. Never scatter magic strings across modules.
+ # ---
+ 
+ DOMAIN = "shower_guard"
+-VERSION = "1.4.0"
++VERSION = "1.5.0"
+ 
+-# Session Detection
+-# Humidity level (% RH) that triggers session start.
+-DEFAULT_HUMIDITY_THRESHOLD: float = 75.0
++# Session Detection (v1.5, ADR-0004)
++# Session start is relative to a tracked ambient baseline, not a flat
++# absolute value: a session begins once humidity has risen this many points
++# above the baseline. Replaces the old flat DEFAULT_HUMIDITY_THRESHOLD, which
++# under-detected sessions starting from a high ambient baseline — e.g. a
++# session starting at 58% wasn't detected until it crossed a flat 75% floor,
++# hiding ~17 points of real rise from the Decision Engine's humidity-delta
++# policy (which measures rise from the session-start baseline).
++DEFAULT_HUMIDITY_START_DELTA: float = 3.0
++CONF_HUMIDITY_START_DELTA = "humidity_start_delta"
+ 
+-# How long (seconds) humidity must stay below the threshold before a session
+-# is considered ended. Prevents false endings from brief dips.
++# Time constant (seconds) for the ambient-baseline EMA, tracked only while
++# IDLE and frozen the instant a session starts. Large enough that the
++# shower's own fast rise can't drag the baseline upward mid-session (it's
++# frozen anyway once ACTIVE), but responsive enough to track genuine ambient
++# drift (season, weather, ventilation) over the hours between showers.
++DEFAULT_BASELINE_TIME_CONSTANT_SECONDS: float = 600.0  # 10 minutes
++CONF_BASELINE_TIME_CONSTANT_SECONDS = "baseline_time_constant_seconds"
++
++# How long (seconds) humidity must stay below the session's frozen start
++# threshold before a session is considered ended. Prevents false endings
++# from brief dips. (Hysteresis behavior only — not a trigger level.)
+ DEFAULT_COOLDOWN_SECONDS: int = 300  # 5 minutes
+ 
+ # configuration.yaml keys (Sensor Layer wiring)
+ CONF_HUMIDITY_SENSOR = "humidity_sensor"
+-CONF_HUMIDITY_THRESHOLD = "humidity_threshold"
+ CONF_COOLDOWN_SECONDS = "cooldown_seconds"
+ 
+ # Decision Engine (see ADR-0001)
+@@ -83,3 +98,11 @@ ENTITY_ID_HUMIDITY_DELTA = f"sensor.{DOMAIN}_humidity_delta"
+ # above is measured from. Published alongside the delta for the same reason:
+ # so a dashboard can show it without any YAML/template re-tracking it.
+ ENTITY_ID_SESSION_BASELINE_HUMIDITY = f"sensor.{DOMAIN}_baseline_humidity"
++
++# Whether a shower session is currently active (ACTIVE or COOLDOWN), published
++# the same way as the two entities above (v1.5). Session start is no longer a
++# static number a template sensor can compare against (it's the stateful
++# ambient baseline in session.py), so this entity replaces the packaged
++# YAML's own hardcoded threshold comparison — the packaged YAML should read
++# this entity rather than re-deriving session state itself.
++ENTITY_ID_SESSION_ACTIVE = f"binary_sensor.{DOMAIN}_session_active"
+diff --git a/custom_components/shower_guard/manifest.json b/custom_components/shower_guard/manifest.json
+index ac76efd..754b3c6 100644
+--- a/custom_components/shower_guard/manifest.json
++++ b/custom_components/shower_guard/manifest.json
+@@ -1,7 +1,7 @@
+ {
+ 	"domain": "shower_guard",
+ 	"name": "Shower Guard",
+-	"version": "1.4.0",
++	"version": "1.5.0",
+ 	"documentation": "https://github.com/algritz/shower_guard",
+ 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
+ 	"dependencies": [],
+diff --git a/custom_components/shower_guard/replay.py b/custom_components/shower_guard/replay.py
+index e74b2aa..923c62e 100644
+--- a/custom_components/shower_guard/replay.py
++++ b/custom_components/shower_guard/replay.py
+@@ -18,9 +18,10 @@ from datetime import datetime
+ from typing import Iterable, List, Optional, Tuple
+ 
+ from .const import (
++    DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+     DEFAULT_COOLDOWN_SECONDS,
+     DEFAULT_DECISION_LOG_SIZE,
+-    DEFAULT_HUMIDITY_THRESHOLD,
++    DEFAULT_HUMIDITY_START_DELTA,
+     DEFAULT_MAX_HUMIDITY_DELTA,
+     DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+ )
+@@ -41,8 +42,9 @@ class ReplayResult:
+ def replay(
+     readings: Iterable[Reading],
+     *,
+-    humidity_threshold: float = DEFAULT_HUMIDITY_THRESHOLD,
++    humidity_start_delta: float = DEFAULT_HUMIDITY_START_DELTA,
+     cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
++    baseline_time_constant_seconds: float = DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+     max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
+     max_session_seconds: Optional[float] = None,
+     presence_confirmation_window_seconds: float = DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+@@ -66,7 +68,9 @@ def replay(
+     sorted oldest-first; they don't need matching timestamps or lengths.
+     """
+     detector = SessionDetector(
+-        humidity_threshold=humidity_threshold, cooldown_seconds=cooldown_seconds
++        humidity_start_delta=humidity_start_delta,
++        cooldown_seconds=cooldown_seconds,
++        baseline_time_constant_seconds=baseline_time_constant_seconds,
+     )
+     engine = DecisionEngine(
+         max_humidity_delta=max_humidity_delta,
+@@ -163,11 +167,16 @@ def _main() -> None:
+         help="Optional CSV file with 'timestamp,presence' columns (on/off).",
+     )
+     parser.add_argument(
+-        "--humidity-threshold", type=float, default=DEFAULT_HUMIDITY_THRESHOLD
++        "--humidity-start-delta", type=float, default=DEFAULT_HUMIDITY_START_DELTA
+     )
+     parser.add_argument(
+         "--cooldown-seconds", type=int, default=DEFAULT_COOLDOWN_SECONDS
+     )
++    parser.add_argument(
++        "--baseline-time-constant-seconds",
++        type=float,
++        default=DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
++    )
+     parser.add_argument(
+         "--max-humidity-delta", type=float, default=DEFAULT_MAX_HUMIDITY_DELTA
+     )
+@@ -190,8 +199,9 @@ def _main() -> None:
+     )
+     result = replay(
+         readings,
+-        humidity_threshold=args.humidity_threshold,
++        humidity_start_delta=args.humidity_start_delta,
+         cooldown_seconds=args.cooldown_seconds,
++        baseline_time_constant_seconds=args.baseline_time_constant_seconds,
+         max_humidity_delta=args.max_humidity_delta,
+         max_session_seconds=args.max_session_seconds,
+         presence_confirmation_window_seconds=args.presence_confirmation_window_seconds,
+diff --git a/custom_components/shower_guard/session.py b/custom_components/shower_guard/session.py
+index 1c20c2b..d0bbd99 100644
+--- a/custom_components/shower_guard/session.py
++++ b/custom_components/shower_guard/session.py
+@@ -1,19 +1,25 @@
+ # ---
+ # purpose: Session Detection layer — determines when a shower session starts,
+-#          continues, resumes, or ends based on humidity readings.
+-# version: 1.1.0
++#          continues, resumes, or ends based on humidity readings, using a
++#          dynamic ambient baseline instead of a flat absolute threshold.
++# version: 1.2.0 (integrated into repo v1.5.0, ADR-0004)
+ # note:    Pure Python. No Home Assistant imports. Safe to unit-test and replay.
+ # ---
+ 
+ from __future__ import annotations
+ 
+ import logging
++import math
+ from dataclasses import dataclass
+ from datetime import datetime
+ from enum import Enum
+ from typing import Optional
+ 
+-from .const import DEFAULT_COOLDOWN_SECONDS, DEFAULT_HUMIDITY_THRESHOLD
++from .const import (
++    DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
++    DEFAULT_COOLDOWN_SECONDS,
++    DEFAULT_HUMIDITY_START_DELTA,
++)
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
+@@ -57,27 +63,48 @@ class SessionDetector:
+     Feed humidity readings via ``update()``. Receive a ``StateChange`` whenever
+     the session transitions, or ``None`` when the state is unchanged.
+ 
++    Session start is relative, not absolute (v1.2): while IDLE, an ambient
++    baseline is tracked via a time-based EMA (updated only in IDLE, frozen the
++    instant a session starts). A session starts once humidity has risen
++    ``humidity_start_delta`` points above that baseline — capturing the true
++    starting point of a shower regardless of the room's ambient humidity that
++    day. ``active_since_humidity`` is frozen at the baseline itself (not the
++    raw crossing reading), so the Decision Engine's delta-cutoff policy sees
++    the *entire* rise, not just the portion after an old flat floor (e.g.
++    75%) happened to be crossed.
++
+     State machine:
+ 
+-        IDLE ──[humidity >= threshold]──► ACTIVE
+-        ACTIVE ──[humidity < threshold]──► COOLDOWN
+-        COOLDOWN ──[humidity >= threshold]──► ACTIVE  (emit RESUMED)
+-        COOLDOWN ──[cooldown elapsed]──► IDLE          (emit ENDED)
++        IDLE ──[humidity - baseline >= start_delta]──► ACTIVE   (emit STARTED)
++        ACTIVE ──[humidity < frozen session_start_threshold]──► COOLDOWN
++        COOLDOWN ──[humidity >= frozen session_start_threshold]──► ACTIVE  (emit RESUMED)
++        COOLDOWN ──[cooldown elapsed]──► IDLE                    (emit ENDED)
++
++    ``session_start_threshold`` (``baseline + start_delta`` at the moment the
++    session started) is frozen for the life of the session, giving the same
++    hysteresis behavior the old flat threshold provided for ACTIVE/COOLDOWN
++    transitions — only the *start* trigger is now baseline-relative.
+     """
+ 
+     def __init__(
+         self,
+-        humidity_threshold: float = DEFAULT_HUMIDITY_THRESHOLD,
++        humidity_start_delta: float = DEFAULT_HUMIDITY_START_DELTA,
+         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
++        baseline_time_constant_seconds: float = DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+     ) -> None:
+-        self.humidity_threshold = humidity_threshold
++        self.humidity_start_delta = humidity_start_delta
+         self.cooldown_seconds = cooldown_seconds
++        self.baseline_time_constant_seconds = baseline_time_constant_seconds
+ 
+         self._state: SessionState = SessionState.IDLE
+         self._cooldown_start: Optional[datetime] = None
+         self._active_since: Optional[datetime] = None
+         self._active_since_humidity: Optional[float] = None
+ 
++        self._baseline: Optional[float] = None
++        self._baseline_updated_at: Optional[datetime] = None
++        self._session_start_threshold: Optional[float] = None
++
+     # ------------------------------------------------------------------
+     # Public API
+     # ------------------------------------------------------------------
+@@ -99,14 +126,23 @@ class SessionDetector:
+     @property
+     def active_since_humidity(self) -> Optional[float]:
+         """
+-        Humidity reading used as the current baseline: set on STARTED, reset
+-        to the RESUMED reading (so a sibling starting a fresh shower during
+-        the cooldown window gets its own baseline), or ``None`` if IDLE. Used
+-        by the Decision Engine to compute humidity rise without duplicating
+-        Session Detection state.
++        Humidity baseline used as the current session's starting point: set
++        to the ambient baseline on STARTED, reset to the raw RESUMED reading
++        (so a sibling starting a fresh shower during the cooldown window gets
++        its own baseline), or ``None`` if IDLE. Used by the Decision Engine to
++        compute humidity rise without duplicating Session Detection state.
+         """
+         return self._active_since_humidity
+ 
++    @property
++    def baseline_humidity(self) -> Optional[float]:
++        """
++        Current ambient baseline. Updates continuously while IDLE (time-based
++        EMA) and is frozen for the duration of a session. ``None`` before the
++        first reading has ever been seen.
++        """
++        return self._baseline
++
+     def update(self, humidity: float, now: datetime) -> Optional[StateChange]:
+         """
+         Process a new humidity reading.
+@@ -119,19 +155,49 @@ class SessionDetector:
+         Returns:
+             A ``StateChange`` if the session state changed, otherwise ``None``.
+         """
+-        above = humidity >= self.humidity_threshold
+-
+         if self._state is SessionState.IDLE:
++            self._update_baseline(humidity, now)
++            above = (
++                self._baseline is not None
++                and (humidity - self._baseline) >= self.humidity_start_delta
++            )
+             return self._from_idle(above, humidity, now)
+ 
+         if self._state is SessionState.ACTIVE:
++            above = humidity >= self._session_start_threshold
+             return self._from_active(above, humidity, now)
+ 
+         if self._state is SessionState.COOLDOWN:
++            above = humidity >= self._session_start_threshold
+             return self._from_cooldown(above, humidity, now)
+ 
+         return None  # unreachable
+ 
++    # ------------------------------------------------------------------
++    # Baseline tracking (IDLE only)
++    # ------------------------------------------------------------------
++
++    def _update_baseline(self, humidity: float, now: datetime) -> None:
++        """
++        Time-based EMA so irregular sensor push intervals don't distort the
++        smoothing — a 2s gap and a 10-minute gap are weighted correctly.
++        Not called while ACTIVE/COOLDOWN, so the baseline resumes tracking
++        (and naturally catches back up over time) once a session ends,
++        rather than needing an explicit reset.
++        """
++        if self._baseline is None:
++            self._baseline = humidity
++            self._baseline_updated_at = now
++            return
++
++        dt = max((now - self._baseline_updated_at).total_seconds(), 0.0)
++        if dt == 0.0:
++            return
++
++        alpha = 1.0 - math.exp(-dt / self.baseline_time_constant_seconds)
++        self._baseline += alpha * (humidity - self._baseline)
++        self._baseline_updated_at = now
++
+     # ------------------------------------------------------------------
+     # Private state handlers
+     # ------------------------------------------------------------------
+@@ -141,7 +207,11 @@ class SessionDetector:
+     ) -> Optional[StateChange]:
+         if above:
+             self._active_since = now
+-            self._active_since_humidity = humidity
++            # Freeze the baseline itself as the session's starting point —
++            # not the raw reading that crossed the trigger — so the full
++            # rise from true ambient conditions is visible downstream.
++            self._active_since_humidity = self._baseline
++            self._session_start_threshold = self._baseline + self.humidity_start_delta
+             return self._transition(SessionEvent.STARTED, SessionState.ACTIVE, humidity, now)
+         return None
+ 
+@@ -174,6 +244,7 @@ class SessionDetector:
+             self._cooldown_start = None
+             self._active_since = None
+             self._active_since_humidity = None
++            self._session_start_threshold = None
+             return self._transition(SessionEvent.ENDED, SessionState.IDLE, humidity, now)
+ 
+         return None
+diff --git a/src/packages/shower_guard.yaml b/src/packages/shower_guard.yaml
+index 739f271..dc12d99 100644
+--- a/src/packages/shower_guard.yaml
++++ b/src/packages/shower_guard.yaml
+@@ -2,7 +2,7 @@
+ #
+ # Shower Guard
+ #
+-# Version : 1.1.0
++# Version : 1.5.0
+ #
+ # Purpose
+ # -------
+@@ -12,6 +12,13 @@
+ # The custom component owns all session detection and decision logic.
+ # This package only adds helpers and template sensors that mirror its state.
+ #
++# v1.5 (ADR-0004): session start is no longer a flat number a template
++# sensor can compare against (it's now the stateful ambient baseline owned
++# by session.py). The "Session State"/"Session Active" sensors below read
++# binary_sensor.shower_guard_session_active, which the integration itself
++# publishes, instead of re-deriving session state from a hardcoded humidity
++# threshold.
++#
+ ###############################################################################
+ 
+ ###############################################################################
+@@ -38,6 +45,9 @@ template:
+         icon: mdi:shower
+         state: >
+           {{ states('binary_sensor.shower_guard_session_active') }}
++        # Note: this mirrors the integration's own published entity — see
++        # the binary_sensor below, which is the actual source of truth as
++        # of v1.5 (ADR-0004). Kept for backward-compatible entity naming.
+ 
+       - name: Shower Guard Humidity
+         unique_id: shower_guard_humidity
+@@ -72,12 +82,16 @@ template:
+ 
+   - binary_sensor:
+ 
+-      - name: Shower Guard Session Active
+-        unique_id: shower_guard_session_active
+-        device_class: running
+-        icon: mdi:shower-head
+-        state: >
+-              {{ states('sensor.bathroom_third_reality_inc_3rths0224z_humidity') | float(0) >= 75.0 }}
++      # Note: "Shower Guard Session Active" (binary_sensor.shower_guard_
++      # session_active) is intentionally NOT defined here. As of v1.5
++      # (ADR-0004), session start/active is a stateful, dynamic-baseline
++      # computation owned by session.py — there's no flat number a template
++      # sensor can compare against anymore. The integration itself publishes
++      # this entity directly (see __init__.py's _publish_decision_state /
++      # ENTITY_ID_SESSION_ACTIVE in const.py). Re-adding a hardcoded
++      # threshold comparison here would silently drift from the real session
++      # state, exactly the architectural-debt failure mode this project
++      # tries to avoid (see ADR-0001's layer-separation principle).
+ 
+       - name: Shower Guard Presence Detected
+         unique_id: shower_guard_presence_detected
+diff --git a/tests/test_init.py b/tests/test_init.py
+index 68e3ce5..9a6399f 100644
+--- a/tests/test_init.py
++++ b/tests/test_init.py
+@@ -239,7 +239,7 @@ def test_presence_sensor_no_longer_disables_duration_fallback():
+     assert engine.max_session_seconds == 60
+ 
+ 
+-def test_async_setup_uses_custom_threshold_and_cooldown():
++def test_async_setup_uses_custom_start_delta_and_cooldown():
+     hass = make_hass()
+     patch_track_state_change()
+ 
+@@ -249,7 +249,7 @@ def test_async_setup_uses_custom_threshold_and_cooldown():
+             {
+                 DOMAIN: {
+                     "humidity_sensor": "sensor.bathroom_humidity",
+-                    "humidity_threshold": 60.0,
++                    "humidity_start_delta": 5.0,
+                     "cooldown_seconds": 30,
+                 }
+             },
+@@ -257,10 +257,30 @@ def test_async_setup_uses_custom_threshold_and_cooldown():
+     )
+ 
+     detector = hass.data[DOMAIN]["detector"]
+-    assert detector.humidity_threshold == 60.0
++    assert detector.humidity_start_delta == 5.0
+     assert detector.cooldown_seconds == 30
+ 
+ 
++def test_async_setup_uses_custom_baseline_time_constant():
++    hass = make_hass()
++    patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass,
++            {
++                DOMAIN: {
++                    "humidity_sensor": "sensor.bathroom_humidity",
++                    "baseline_time_constant_seconds": 60.0,
++                }
++            },
++        )
++    )
++
++    detector = hass.data[DOMAIN]["detector"]
++    assert detector.baseline_time_constant_seconds == 60.0
++
++
+ # ---------------------------------------------------------------------------
+ # Humidity change callback feeds the Session Detection layer
+ # ---------------------------------------------------------------------------
+@@ -278,6 +298,13 @@ def test_humidity_callback_feeds_detector():
+     detector = hass.data[DOMAIN]["detector"]
+     assert detector.state is SessionState.IDLE
+ 
++    # First reading only seeds the ambient baseline (v1.5) — it can't start
++    # a session on its own.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(captured["callback"](event))
++    assert detector.state is SessionState.IDLE
++
++    # A fast jump well above the barely-moved baseline starts the session.
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(captured["callback"](event))
+ 
+@@ -377,6 +404,9 @@ def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold_with_p
+     )
+     confirm_presence(hass)
+ 
++    # Seed the baseline, then a rise starts the session with a positive delta.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(captured["callback"](event))
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(captured["callback"](event))
+ 
+@@ -403,6 +433,8 @@ def test_humidity_callback_does_not_cut_on_delta_alone_without_presence():
+         )
+     )
+ 
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(captured["callback"](event))
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(captured["callback"](event))
+ 
+@@ -483,9 +515,11 @@ def test_delta_exceeded_stays_available_until_presence_confirmed():
+     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+     presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+ 
+-    # Delta exceeds threshold immediately, but presence hasn't been
+-    # confirmed yet -> stays available.
+-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
++    # Seed the baseline, then a rise starts the session with an exceeded
++    # delta — but presence hasn't been confirmed yet, so it stays available.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(humidity_callback(event))
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
+     asyncio.run(humidity_callback(event))
+     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+ 
+@@ -526,7 +560,11 @@ def test_presence_flicker_off_within_window_still_cuts():
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
+     asyncio.run(presence_callback(event))
+ 
+-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
++    # Seed the baseline, then a rise starts the session with an exceeded
++    # delta — presence is already confirmed, so it cuts right away.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(humidity_callback(event))
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
+     asyncio.run(humidity_callback(event))
+     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_CUT
+ 
+@@ -646,6 +684,8 @@ def test_actuator_called_on_water_cut_decision():
+     )
+     confirm_presence(hass)
+ 
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(captured["callback"](event))
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(captured["callback"](event))
+ 
+@@ -679,6 +719,8 @@ def test_notify_service_called_on_water_cut_decision():
+     )
+     confirm_presence(hass)
+ 
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(captured["callback"](event))
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+     asyncio.run(captured["callback"](event))
+ 
+@@ -779,10 +821,13 @@ def test_actuator_only_calls_configured_side():
+     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+     presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+ 
+-    # Delta exceeds immediately, but presence isn't confirmed yet -> stays
+-    # available, no actuator call (water_available_script isn't configured
+-    # either, so this also confirms that side stays silent).
+-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
++    # Seed the baseline, then a rise starts the session with an exceeded
++    # delta — but presence isn't confirmed yet, so it stays available, no
++    # actuator call (water_available_script isn't configured either, so
++    # this also confirms that side stays silent).
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="50.0")})
++    asyncio.run(humidity_callback(event))
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
+     asyncio.run(humidity_callback(event))
+     assert hass.services.calls == []
+ 
+@@ -817,15 +862,24 @@ def test_humidity_delta_published_on_every_evaluation():
+         )
+     )
+ 
+-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
++    # First reading seeds the baseline (~58) — no session yet, delta unknown.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
+     asyncio.run(captured["callback"](event))
+     published = hass.states.get("sensor.shower_guard_humidity_delta")
+-    assert published["state"] == "0.0"
++    assert published["state"] == "unknown"
+ 
+-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="85.0")})
++    # This rise starts the session — delta is measured from the baseline
++    # (~58), not from this reading itself, so it's ~4.0 (the start delta),
++    # not 0.0 as it would be under the old flat-threshold model.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="62.0")})
++    asyncio.run(captured["callback"](event))
++    published = hass.states.get("sensor.shower_guard_humidity_delta")
++    assert published["state"] == "4.0"
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="72.0")})
+     asyncio.run(captured["callback"](event))
+     published = hass.states.get("sensor.shower_guard_humidity_delta")
+-    assert published["state"] == "10.0"
++    assert published["state"] == "14.0"
+     assert published["attributes"]["unit_of_measurement"] == "%"
+     assert published["attributes"]["max_humidity_delta"] == 15.0
+ 
+@@ -852,7 +906,10 @@ def test_humidity_delta_published_as_unknown_when_idle():
+ 
+ 
+ def test_baseline_humidity_published_on_session_start():
+-    """Session start publishes the baseline as the STARTED reading."""
++    """Session start publishes the tracked ambient baseline, NOT the raw
++    reading that crossed the start trigger (v1.5, ADR-0004) — this is the
++    actual fix for the bug where a session starting from a high ambient
++    baseline hid its pre-trigger rise from the delta-cutoff policy."""
+     hass = make_hass()
+     captured = patch_track_state_change()
+ 
+@@ -862,11 +919,13 @@ def test_baseline_humidity_published_on_session_start():
+         )
+     )
+ 
+-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="76.0")})
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
++    asyncio.run(captured["callback"](event))
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="62.0")})
+     asyncio.run(captured["callback"](event))
+ 
+     published = hass.states.get("sensor.shower_guard_baseline_humidity")
+-    assert published["state"] == "76.0"
++    assert published["state"] == "58.0"  # the ambient baseline, not "62.0"
+     assert published["attributes"]["unit_of_measurement"] == "%"
+ 
+ 
+@@ -907,7 +966,10 @@ def test_baseline_humidity_resets_on_sibling_resume():
+         )
+     )
+ 
+-    for state in ("75.0", "60.0", "76.0"):  # start, cooldown, resume (sibling)
++    # seed, start, cooldown, resume (sibling) — one extra seed reading vs.
++    # the old flat-threshold model, since the first reading here only seeds
++    # the baseline rather than starting a session immediately.
++    for state in ("70.0", "76.0", "60.0", "76.0"):
+         event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+         asyncio.run(captured["callback"](event))
+ 
+@@ -938,18 +1000,23 @@ def test_humidity_delta_cuts_water_quickly_via_wiring():
+     )
+     confirm_presence(hass)
+ 
+-    # Session starts at the threshold (baseline = 75.0).
++    # First reading only seeds the baseline (~75.0) — no session yet, so
++    # this evaluation is trivially available (no active session).
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+     asyncio.run(captured["callback"](event))
+     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+ 
+-    # Humidity jumps well past the delta threshold almost immediately.
++    # Humidity jumps well past the delta threshold almost immediately —
++    # this reading both starts the session and exceeds the cutoff delta.
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="85.0")})
+     asyncio.run(captured["callback"](event))
+ 
+     last_decision = hass.data[DOMAIN]["last_decision"]
+     assert last_decision.decision is Decision.WATER_CUT
+-    assert last_decision.humidity_delta == 10.0
++    # The baseline drifts by a negligible amount between the two readings
++    # (real wall-clock microseconds against a 600s EMA time constant), so
++    # compare with a small tolerance rather than exact equality.
++    assert abs(last_decision.humidity_delta - 10.0) < 0.01
+ 
+ 
+ def test_cold_shower_stays_available_indefinitely_below_delta():
+@@ -970,16 +1037,20 @@ def test_cold_shower_stays_available_indefinitely_below_delta():
+         )
+     )
+ 
+-    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
++    # Seed the baseline, then a rise that clears the start delta (so the
++    # session actually starts) but stays well under the cutoff delta.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="70.0")})
++    asyncio.run(captured["callback"](event))
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="74.0")})
+     asyncio.run(captured["callback"](event))
+ 
+-    # Humidity barely rises — a cold shower generating little steam.
++    # Humidity barely rises further — a cold shower generating little steam.
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="77.0")})
+     asyncio.run(captured["callback"](event))
+ 
+     last_decision = hass.data[DOMAIN]["last_decision"]
+     assert last_decision.decision is Decision.WATER_AVAILABLE
+-    assert last_decision.humidity_delta == 2.0
++    assert abs(last_decision.humidity_delta - 7.0) < 0.01
+ 
+ 
+ def test_sibling_shower_gets_fresh_baseline_after_resume():
+@@ -1001,8 +1072,9 @@ def test_sibling_shower_gets_fresh_baseline_after_resume():
+         )
+     )
+ 
+-    # Kid A showers: humidity rises close to (but under) the cut threshold.
+-    for state in ("75.0", "88.0"):
++    # Seed the baseline near 72, then kid A showers: humidity rises close to
++    # (but under) the cut threshold (delta ~14 < 15).
++    for state in ("72.0", "86.0"):
+         event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+         asyncio.run(captured["callback"](event))
+     assert hass.data[DOMAIN]["last_decision"].decision is Decision.WATER_AVAILABLE
+@@ -1044,6 +1116,8 @@ def test_duration_fallback_cuts_water_via_wiring_without_presence_sensor():
+         )
+     )
+ 
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="70.0")})
++    asyncio.run(captured["callback"](event))
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+     asyncio.run(captured["callback"](event))
+ 
+@@ -1074,6 +1148,8 @@ def test_duration_fallback_still_active_via_wiring_with_presence_sensor():
+     )
+ 
+     humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="70.0")})
++    asyncio.run(humidity_callback(event))
+     event = SimpleNamespace(data={"new_state": SimpleNamespace(state="75.0")})
+     asyncio.run(humidity_callback(event))
+ 
+@@ -1091,7 +1167,8 @@ if __name__ == "__main__":
+         test_async_setup_uses_custom_max_humidity_delta,
+         test_async_setup_uses_custom_max_session_seconds_without_presence_sensor,
+         test_presence_sensor_no_longer_disables_duration_fallback,
+-        test_async_setup_uses_custom_threshold_and_cooldown,
++        test_async_setup_uses_custom_start_delta_and_cooldown,
++        test_async_setup_uses_custom_baseline_time_constant,
+         test_humidity_callback_feeds_detector,
+         test_humidity_callback_ignores_unavailable_state,
+         test_humidity_callback_ignores_non_numeric_state,
+diff --git a/tests/test_replay.py b/tests/test_replay.py
+index 2b7c43b..e863868 100644
+--- a/tests/test_replay.py
++++ b/tests/test_replay.py
+@@ -117,15 +117,23 @@ def test_replay_duration_fallback_disabled_by_default():
+ 
+ 
+ def test_replay_duration_fallback_cuts_water_when_enabled():
+-    readings = [(t(0), 75.0), (t(900), 77.0)]
+-    result = replay(readings, max_humidity_delta=15.0, max_session_seconds=900)
++    """A session starts quickly (seed + fast rise), then a long low-delta
++    stretch trips the duration fallback rather than the delta policy."""
++    readings = [
++        (t(0), 58.0),    # seed baseline
++        (t(5), 70.0),    # fast rise -> session starts
++        (t(905), 72.0),  # 900s after start, delta still small
++    ]
++    result = replay(readings, max_humidity_delta=20.0, max_session_seconds=900)
+ 
+-    assert result.decision_log.last.decision is Decision.WATER_CUT
++    last = result.decision_log.last
++    assert last.decision is Decision.WATER_CUT
++    assert "exceeded max duration" in last.reason.lower()
+ 
+ 
+-def test_replay_respects_custom_threshold_and_cooldown():
+-    readings = [(t(0), 60.0)]  # below default 75.0 threshold
+-    result = replay(readings, humidity_threshold=60.0)
++def test_replay_respects_custom_start_delta():
++    readings = [(t(0), 50.0), (t(60), 53.5)]  # below default 3.0 start delta
++    result = replay(readings, humidity_start_delta=2.0)
+ 
+     assert result.state_changes[0].event is SessionEvent.STARTED
+ 
+@@ -164,8 +172,8 @@ def test_csv_readings_can_be_replayed():
+     ) as f:
+         writer = csv.writer(f)
+         writer.writerow(["timestamp", "humidity"])
+-        writer.writerow([t(0).isoformat(), "80.0"])
+-        writer.writerow([t(900).isoformat(), "85.0"])
++        writer.writerow([t(0).isoformat(), "58.0"])
++        writer.writerow([t(5).isoformat(), "70.0"])
+         path = f.name
+ 
+     try:
+@@ -186,7 +194,7 @@ if __name__ == "__main__":
+         test_replay_presence_confirmation_tolerates_brief_gap,
+         test_replay_duration_fallback_disabled_by_default,
+         test_replay_duration_fallback_cuts_water_when_enabled,
+-        test_replay_respects_custom_threshold_and_cooldown,
++        test_replay_respects_custom_start_delta,
+         test_replay_decision_log_respects_size_limit,
+         test_load_readings_from_csv,
+         test_csv_readings_can_be_replayed,
+diff --git a/tests/test_session.py b/tests/test_session.py
+index 2e7f2b8..eea9019 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -1,6 +1,7 @@
+ # ---
+-# purpose: Tests for the Session Detection layer (v0.2).
+-# version: 0.2.0
++# purpose: Tests for the Session Detection layer (v1.2 — dynamic ambient
++#          baseline replaces the flat absolute humidity threshold).
++# version: 1.2.0
+ # ---
+ 
+ import sys
+@@ -39,60 +40,122 @@ def t(seconds: int = 0) -> datetime:
+     return T0 + timedelta(seconds=seconds)
+ 
+ 
+-def make_detector(threshold: float = 75.0, cooldown: int = 300) -> SessionDetector:
+-    return SessionDetector(humidity_threshold=threshold, cooldown_seconds=cooldown)
++def make_detector(start_delta: float = 3.0, cooldown: int = 300, tau: float = 600.0) -> SessionDetector:
++    return SessionDetector(
++        humidity_start_delta=start_delta,
++        cooldown_seconds=cooldown,
++        baseline_time_constant_seconds=tau,
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# IDLE state
++# Baseline tracking (IDLE only)
+ # ---------------------------------------------------------------------------
+ 
+-def test_idle_low_humidity_no_change():
+-    """Low humidity in IDLE produces no state change."""
++def test_first_reading_seeds_baseline_and_never_starts_session():
++    """The very first reading has no history to compare against — it seeds
++    the baseline exactly, and can never itself trigger a start, no matter
++    how high it is."""
+     d = make_detector()
+-    result = d.update(humidity=50.0, now=t())
++    result = d.update(humidity=95.0, now=t(0))
+     assert result is None
+     assert d.state is SessionState.IDLE
++    assert d.baseline_humidity == 95.0
+ 
+ 
+-def test_idle_at_threshold_starts_session():
+-    """Humidity exactly at threshold triggers session start."""
+-    d = make_detector(threshold=75.0)
+-    change = d.update(humidity=75.0, now=t())
++def test_baseline_stays_put_under_stable_humidity():
++    """Repeated identical readings keep the baseline unchanged and never
++    trigger a start."""
++    d = make_detector()
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=58.0, now=t(60))
++    result = d.update(humidity=58.0, now=t(120))
++    assert result is None
++    assert d.state is SessionState.IDLE
++    assert d.baseline_humidity == 58.0
++
++
++def test_slow_ambient_drift_does_not_start_a_session():
++    """A slow rise (e.g. weather/seasonal drift over an hour) gets absorbed
++    into the baseline rather than mistaken for a shower."""
++    d = make_detector(start_delta=3.0, tau=600.0)
++    d.update(humidity=58.0, now=t(0))
++    result = d.update(humidity=61.0, now=t(3600))  # 1 hour later, +3 total
++    assert result is None
++    assert d.state is SessionState.IDLE
++
++
++def test_fast_rise_above_baseline_starts_session():
++    """A quick rise well above the (barely-moved) baseline starts a session,
++    even if the room's ambient humidity that day is far from any fixed
++    absolute floor."""
++    d = make_detector(start_delta=3.0, tau=600.0)
++    d.update(humidity=58.0, now=t(0))          # seed baseline ~58
++    d.update(humidity=58.0, now=t(300))        # stays ~58
++    change = d.update(humidity=62.0, now=t(305))  # fast jump 5s later
+     assert change is not None
+     assert change.event is SessionEvent.STARTED
+-    assert change.previous is SessionState.IDLE
+-    assert change.current is SessionState.ACTIVE
+     assert d.state is SessionState.ACTIVE
++    # active_since_humidity is the ambient baseline, not the raw 62.0 reading
++    # — this is the fix for the "missing rise" bug: a session starting from
++    # a high ambient baseline no longer hides the pre-trigger rise from the
++    # Decision Engine's delta-cutoff policy.
++    assert d.active_since_humidity < 59.0
+ 
+ 
+-def test_idle_above_threshold_starts_session():
+-    """Humidity above threshold triggers session start."""
++def test_baseline_humidity_property_exposes_current_value():
+     d = make_detector()
+-    change = d.update(humidity=90.0, now=t())
+-    assert change is not None
+-    assert change.event is SessionEvent.STARTED
+-    assert d.state is SessionState.ACTIVE
++    d.update(humidity=50.0, now=t(0))
++    assert d.baseline_humidity == 50.0
++
++
++def test_ema_time_constant_controls_smoothing_speed():
++    """A shorter time constant tracks the ambient baseline faster. Uses a
++    high start_delta so this test is purely about baseline smoothing, not
++    session start."""
++    fast = SessionDetector(humidity_start_delta=50.0, baseline_time_constant_seconds=10.0)
++    slow = SessionDetector(humidity_start_delta=50.0, baseline_time_constant_seconds=600.0)
++
++    for d in (fast, slow):
++        d.update(humidity=50.0, now=t(0))
++        d.update(humidity=60.0, now=t(10))
++
++    assert fast.baseline_humidity > slow.baseline_humidity
++
++
++def test_baseline_catches_up_after_a_session_ends():
++    """After a session ends, the ambient baseline (frozen during the
++    session) resumes tracking and converges back to real ambient conditions
++    over time — it does not stay pinned to the pre-shower reading forever."""
++    d = make_detector(start_delta=3.0, cooldown=10, tau=5.0)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=70.0, now=t(5))    # STARTED
++    d.update(humidity=40.0, now=t(10))   # COOLDOWN
++    d.update(humidity=40.0, now=t(20))   # ENDED
++
++    assert d.state is SessionState.IDLE
++    d.update(humidity=40.0, now=t(80))   # a minute of fresh air later
++    assert d.baseline_humidity < 41.0
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# ACTIVE state
++# ACTIVE state — frozen session_start_threshold provides hysteresis
+ # ---------------------------------------------------------------------------
+ 
+-def test_active_stays_active_while_humid():
+-    """Sustained high humidity keeps state ACTIVE with no event."""
+-    d = make_detector()
+-    d.update(humidity=80.0, now=t())          # → ACTIVE
+-    result = d.update(humidity=85.0, now=t(60))
++def test_active_stays_active_while_above_frozen_threshold():
++    d = make_detector(start_delta=3.0)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=62.0, now=t(5))   # STARTED, threshold frozen ~= 58+3
++    result = d.update(humidity=90.0, now=t(65))
+     assert result is None
+     assert d.state is SessionState.ACTIVE
+ 
+ 
+-def test_active_enters_cooldown_on_humidity_drop():
+-    """Humidity drop from ACTIVE enters COOLDOWN silently (no event yet)."""
+-    d = make_detector()
+-    d.update(humidity=80.0, now=t())          # → ACTIVE
+-    result = d.update(humidity=60.0, now=t(10))
++def test_active_enters_cooldown_when_dropping_below_frozen_threshold():
++    d = make_detector(start_delta=3.0)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=62.0, now=t(5))   # STARTED
++    result = d.update(humidity=59.0, now=t(65))  # below ~61 threshold
+     assert result is None
+     assert d.state is SessionState.COOLDOWN
+ 
+@@ -102,112 +165,44 @@ def test_active_enters_cooldown_on_humidity_drop():
+ # ---------------------------------------------------------------------------
+ 
+ def test_cooldown_ends_session_after_elapsed():
+-    """Cooldown expiry emits ENDED and returns to IDLE."""
+-    d = make_detector(cooldown=300)
+-    d.update(humidity=80.0, now=t())          # → ACTIVE
+-    d.update(humidity=60.0, now=t(10))        # → COOLDOWN
++    d = make_detector(start_delta=3.0, cooldown=300)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=62.0, now=t(5))            # STARTED
++    d.update(humidity=59.0, now=t(65))           # COOLDOWN
+ 
+-    # Just before expiry — still in cooldown.
+-    result = d.update(humidity=60.0, now=t(10 + 299))
++    result = d.update(humidity=59.0, now=t(65 + 299))
+     assert result is None
+     assert d.state is SessionState.COOLDOWN
+ 
+-    # At expiry — session ends.
+-    change = d.update(humidity=60.0, now=t(10 + 300))
++    change = d.update(humidity=59.0, now=t(65 + 300))
+     assert change is not None
+     assert change.event is SessionEvent.ENDED
+-    assert change.current is SessionState.IDLE
+     assert d.state is SessionState.IDLE
+ 
+ 
+-def test_cooldown_resumes_on_humidity_rise():
+-    """Humidity rising during cooldown emits RESUMED and returns to ACTIVE."""
+-    d = make_detector(cooldown=300)
+-    d.update(humidity=80.0, now=t())          # → ACTIVE
+-    d.update(humidity=60.0, now=t(10))        # → COOLDOWN
++def test_cooldown_resumes_on_rise_above_frozen_threshold():
++    d = make_detector(start_delta=3.0, cooldown=300)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=62.0, now=t(5))            # STARTED
++    d.update(humidity=59.0, now=t(65))           # COOLDOWN
+ 
+-    change = d.update(humidity=80.0, now=t(60))
++    change = d.update(humidity=62.0, now=t(120))
+     assert change is not None
+     assert change.event is SessionEvent.RESUMED
+-    assert change.current is SessionState.ACTIVE
+     assert d.state is SessionState.ACTIVE
+ 
+ 
+-def test_cooldown_not_expired_no_event():
+-    """Low humidity within cooldown window produces no event."""
+-    d = make_detector(cooldown=300)
+-    d.update(humidity=80.0, now=t())          # → ACTIVE
+-    d.update(humidity=60.0, now=t(10))        # → COOLDOWN
+-
+-    result = d.update(humidity=60.0, now=t(100))
+-    assert result is None
+-    assert d.state is SessionState.COOLDOWN
+-
+-
+-# ---------------------------------------------------------------------------
+-# StateChange dataclass
+-# ---------------------------------------------------------------------------
++def test_sibling_shower_gets_fresh_baseline_on_resume():
++    """A sibling starting a fresh shower during the cooldown window resets
++    the humidity baseline to the RESUMED reading, rather than inheriting the
++    first sibling's cumulative rise (unchanged from v1.1 behavior)."""
++    d = make_detector(start_delta=3.0, cooldown=300)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=70.0, now=t(5))            # STARTED, baseline ~58
++    d.update(humidity=60.0, now=t(65))           # COOLDOWN
+ 
+-def test_state_change_str_is_readable():
+-    """StateChange.__str__ should include event name, states, and humidity."""
+-    d = make_detector()
+-    change = d.update(humidity=80.0, now=T0)
+-    assert "STARTED" in str(change)
+-    assert "idle" in str(change)
+-    assert "active" in str(change)
+-    assert "80.0" in str(change)
+-
+-
+-# ---------------------------------------------------------------------------
+-# Custom threshold / cooldown
+-# ---------------------------------------------------------------------------
+-
+-def test_custom_threshold():
+-    """Detector respects a custom humidity threshold."""
+-    d = make_detector(threshold=60.0)
+-    assert d.update(humidity=59.9, now=t()) is None
+-    change = d.update(humidity=60.0, now=t(1))
+-    assert change is not None
+-    assert change.event is SessionEvent.STARTED
+-
+-
+-def test_custom_cooldown():
+-    """Detector respects a custom cooldown duration."""
+-    d = make_detector(cooldown=30)
+-    d.update(humidity=80.0, now=t())     # → ACTIVE
+-    d.update(humidity=50.0, now=t(1))    # → COOLDOWN
+-
+-    assert d.update(humidity=50.0, now=t(29)) is None   # not yet
+-    change = d.update(humidity=50.0, now=t(31))         # expired
+-    assert change is not None
+-    assert change.event is SessionEvent.ENDED
+-
+-
+-# ---------------------------------------------------------------------------
+-# Full session lifecycle
+-# ---------------------------------------------------------------------------
+-
+-def test_full_session_lifecycle():
+-    """Walk through a complete session: start → cooldown → end."""
+-    d = make_detector(cooldown=300)
+-
+-    # Shower starts
+-    c1 = d.update(humidity=80.0, now=t(0))
+-    assert c1.event is SessionEvent.STARTED
+-
+-    # Shower running
+-    assert d.update(humidity=85.0, now=t(300)) is None
+-
+-    # Shower stops
+-    assert d.update(humidity=65.0, now=t(600)) is None   # → COOLDOWN silently
+-    assert d.state is SessionState.COOLDOWN
+-
+-    # Cooldown expires
+-    c2 = d.update(humidity=65.0, now=t(900))
+-    assert c2.event is SessionEvent.ENDED
+-
+-    # Back to idle
+-    assert d.state is SessionState.IDLE
++    d.update(humidity=62.0, now=t(120))          # RESUMED (sibling starts)
++    assert d.active_since_humidity == 62.0       # fresh baseline, not ~58
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -215,35 +210,23 @@ def test_full_session_lifecycle():
+ # ---------------------------------------------------------------------------
+ 
+ def test_active_since_none_when_idle():
+-    """active_since is None before any session starts."""
+     d = make_detector()
+     assert d.active_since is None
+ 
+ 
+ def test_active_since_set_on_start():
+-    """active_since is set to the STARTED timestamp."""
+-    d = make_detector()
+-    d.update(humidity=80.0, now=t(0))
+-    assert d.active_since == t(0)
+-
+-
+-def test_active_since_persists_through_cooldown_and_resume():
+-    """active_since is preserved across COOLDOWN and RESUMED (same session)."""
+-    d = make_detector(cooldown=300)
+-    d.update(humidity=80.0, now=t(0))          # → ACTIVE, active_since = t(0)
+-    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
+-    assert d.active_since == t(0)
+-
+-    d.update(humidity=80.0, now=t(60))         # → RESUMED
+-    assert d.active_since == t(0)
++    d = make_detector(start_delta=3.0)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=62.0, now=t(5))
++    assert d.active_since == t(5)
+ 
+ 
+ def test_active_since_cleared_on_end():
+-    """active_since is cleared once the session ends."""
+-    d = make_detector(cooldown=300)
+-    d.update(humidity=80.0, now=t(0))          # → ACTIVE
+-    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
+-    d.update(humidity=60.0, now=t(310))        # → ENDED
++    d = make_detector(start_delta=3.0, cooldown=10)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=62.0, now=t(5))
++    d.update(humidity=40.0, now=t(10))
++    d.update(humidity=40.0, now=t(20))
+     assert d.active_since is None
+ 
+ 
+@@ -252,62 +235,54 @@ def test_active_since_cleared_on_end():
+ # ---------------------------------------------------------------------------
+ 
+ def test_active_since_humidity_none_when_idle():
+-    """active_since_humidity is None before any session starts."""
+     d = make_detector()
+     assert d.active_since_humidity is None
+ 
+ 
+-def test_active_since_humidity_set_on_start():
+-    """active_since_humidity is set to the humidity that triggered STARTED."""
+-    d = make_detector()
+-    d.update(humidity=80.0, now=t(0))
+-    assert d.active_since_humidity == 80.0
+-
+-
+-def test_active_since_humidity_resets_on_resume():
+-    """active_since_humidity resets to the RESUMED reading (not the original
+-    STARTED reading) so a sibling starting a fresh shower during the
+-    cooldown window gets its own baseline."""
+-    d = make_detector(cooldown=300)
+-    d.update(humidity=80.0, now=t(0))          # → ACTIVE, baseline = 80.0
+-    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
+-    assert d.active_since_humidity == 80.0
++def test_active_since_humidity_cleared_on_end():
++    d = make_detector(start_delta=3.0, cooldown=10)
++    d.update(humidity=58.0, now=t(0))
++    d.update(humidity=62.0, now=t(5))
++    d.update(humidity=40.0, now=t(10))
++    d.update(humidity=40.0, now=t(20))
++    assert d.active_since_humidity is None
+ 
+-    d.update(humidity=76.0, now=t(60))         # → RESUMED (sibling starts)
+-    assert d.active_since_humidity == 76.0     # baseline reset to resume reading
+ 
++# ---------------------------------------------------------------------------
++# StateChange dataclass
++# ---------------------------------------------------------------------------
+ 
+-def test_active_since_humidity_cleared_on_end():
+-    """active_since_humidity is cleared once the session ends."""
+-    d = make_detector(cooldown=300)
+-    d.update(humidity=80.0, now=t(0))          # → ACTIVE
+-    d.update(humidity=60.0, now=t(10))         # → COOLDOWN
+-    d.update(humidity=60.0, now=t(310))        # → ENDED
+-    assert d.active_since_humidity is None
++def test_state_change_str_is_readable():
++    d = make_detector(start_delta=3.0)
++    d.update(humidity=58.0, now=t(0))
++    change = d.update(humidity=62.0, now=t(5))
++    text = str(change)
++    assert "STARTED" in text
++    assert "idle" in text
++    assert "active" in text
++    assert "62.0" in text
+ 
+ 
+ if __name__ == "__main__":
+     tests = [
+-        test_idle_low_humidity_no_change,
+-        test_idle_at_threshold_starts_session,
+-        test_idle_above_threshold_starts_session,
+-        test_active_stays_active_while_humid,
+-        test_active_enters_cooldown_on_humidity_drop,
++        test_first_reading_seeds_baseline_and_never_starts_session,
++        test_baseline_stays_put_under_stable_humidity,
++        test_slow_ambient_drift_does_not_start_a_session,
++        test_fast_rise_above_baseline_starts_session,
++        test_baseline_humidity_property_exposes_current_value,
++        test_ema_time_constant_controls_smoothing_speed,
++        test_baseline_catches_up_after_a_session_ends,
++        test_active_stays_active_while_above_frozen_threshold,
++        test_active_enters_cooldown_when_dropping_below_frozen_threshold,
+         test_cooldown_ends_session_after_elapsed,
+-        test_cooldown_resumes_on_humidity_rise,
+-        test_cooldown_not_expired_no_event,
+-        test_state_change_str_is_readable,
+-        test_custom_threshold,
+-        test_custom_cooldown,
+-        test_full_session_lifecycle,
++        test_cooldown_resumes_on_rise_above_frozen_threshold,
++        test_sibling_shower_gets_fresh_baseline_on_resume,
+         test_active_since_none_when_idle,
+         test_active_since_set_on_start,
+-        test_active_since_persists_through_cooldown_and_resume,
+         test_active_since_cleared_on_end,
+         test_active_since_humidity_none_when_idle,
+-        test_active_since_humidity_set_on_start,
+-        test_active_since_humidity_resets_on_resume,
+         test_active_since_humidity_cleared_on_end,
++        test_state_change_str_is_readable,
+     ]
+     passed = 0
+     failed = 0
+diff --git a/tools/debug_replay.py b/tools/debug_replay.py
+index 0b5e872..704ad6b 100755
+--- a/tools/debug_replay.py
++++ b/tools/debug_replay.py
+@@ -46,14 +46,14 @@ def main():
+             readings.append((parse_iso_ts(row["timestamp"]), float(row["humidity"])))
+ 
+     # Configuration values (from user's shower_guard.yaml)
+-    humidity_threshold = 75.0
++    humidity_start_delta = 3.0
+     cooldown_seconds = 300
+     max_humidity_delta = 15.0
+     max_session_seconds = None  # presence_sensor configured -> duration fallback disabled
+ 
+     result = replay.replay(
+         readings,
+-        humidity_threshold=humidity_threshold,
++        humidity_start_delta=humidity_start_delta,
+         cooldown_seconds=cooldown_seconds,
+         max_humidity_delta=max_humidity_delta,
+         max_session_seconds=max_session_seconds,
