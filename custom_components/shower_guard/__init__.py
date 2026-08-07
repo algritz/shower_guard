@@ -1,6 +1,6 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 1.4.0
+# version: 1.6.0
 # note: Wires the Sensor Layer (humidity entity, optional presence entity)
 #       into Session Detection and the Decision Engine, records every
 #       decision into a bounded DecisionLog, and — when configured — calls
@@ -13,7 +13,10 @@
 #       presence was seen True so brief mmWave dropouts within the
 #       confirmation window don't defeat a real cutoff. The optional
 #       duration fallback (max_session_seconds) is independent of presence
-#       and disabled unless explicitly configured.
+#       and disabled unless explicitly configured. Presence is also now fed
+#       into Session Detection itself (see ADR-0005), so a session already
+#       declining can end as soon as presence clears rather than only on
+#       the next humidity reading or the cooldown timer.
 # ---
 
 import logging
@@ -28,11 +31,14 @@ from .const import (
     CONF_BASELINE_TIME_CONSTANT_SECONDS,
     CONF_COOLDOWN_SECONDS,
     CONF_DECISION_LOG_SIZE,
+    CONF_DECLINE_CONFIRM_SECONDS,
+    CONF_HUMIDITY_DECLINE_DELTA,
     CONF_HUMIDITY_SENSOR,
     CONF_HUMIDITY_START_DELTA,
     CONF_MAX_HUMIDITY_DELTA,
     CONF_MAX_SESSION_SECONDS,
     CONF_NOTIFY_SERVICE,
+    CONF_PRESENCE_CLEAR_CONFIRM_SECONDS,
     CONF_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
     CONF_PRESENCE_SENSOR,
     CONF_WATER_AVAILABLE_SCRIPT,
@@ -40,9 +46,12 @@ from .const import (
     DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DECISION_LOG_SIZE,
+    DEFAULT_DECLINE_CONFIRM_SECONDS,
+    DEFAULT_HUMIDITY_DECLINE_DELTA,
     DEFAULT_HUMIDITY_START_DELTA,
     DEFAULT_MAX_HUMIDITY_DELTA,
     DEFAULT_MAX_SESSION_SECONDS,
+    DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
     DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
     DOMAIN,
     ENTITY_ID_HUMIDITY_DELTA,
@@ -92,6 +101,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         ),
         baseline_time_constant_seconds=domain_config.get(
             CONF_BASELINE_TIME_CONSTANT_SECONDS, DEFAULT_BASELINE_TIME_CONSTANT_SECONDS
+        ),
+        humidity_decline_delta=domain_config.get(
+            CONF_HUMIDITY_DECLINE_DELTA, DEFAULT_HUMIDITY_DECLINE_DELTA
+        ),
+        decline_confirm_seconds=domain_config.get(
+            CONF_DECLINE_CONFIRM_SECONDS, DEFAULT_DECLINE_CONFIRM_SECONDS
+        ),
+        presence_clear_confirm_seconds=domain_config.get(
+            CONF_PRESENCE_CLEAR_CONFIRM_SECONDS, DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS
         ),
     )
 
@@ -261,7 +279,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         now = datetime.now()
         hass.data[DOMAIN]["last_humidity"] = humidity
 
-        change = detector.update(humidity=humidity, now=now)
+        change = detector.update(
+            humidity=humidity, now=now, presence=hass.data[DOMAIN]["presence"]
+        )
         if change is not None:
             _LOGGER.info("Shower Guard: %s", change)
 
@@ -278,8 +298,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             True — the timestamp it was last confirmed, so a delta-triggered
             cutoff can still fire on the next humidity reading even if
             presence has since flickered off (see ADR-0003's confirmation
-            window). Also immediately re-evaluates, since presence changing
-            can flip a cutoff decision without waiting on humidity."""
+            window). Also re-runs Session Detection against the last known
+            humidity reading (see ADR-0005) so a session already declining
+            can end the moment presence is confirmed clear, rather than
+            waiting for the next humidity push — then immediately
+            re-evaluates the Decision Engine, since presence changing can
+            also flip a cutoff decision without waiting on humidity."""
             new_state = event.data.get("new_state")
             if new_state is None:
                 return
@@ -291,7 +315,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             hass.data[DOMAIN]["presence"] = presence
             if presence is True:
                 hass.data[DOMAIN]["last_presence_at"] = datetime.now()
-            await _evaluate_and_record(datetime.now())
+
+            now = datetime.now()
+            last_humidity = hass.data[DOMAIN]["last_humidity"]
+            if last_humidity is not None:
+                change = detector.update(
+                    humidity=last_humidity, now=now, presence=presence
+                )
+                if change is not None:
+                    _LOGGER.info("Shower Guard: %s", change)
+
+            await _evaluate_and_record(now)
 
         hass.data[DOMAIN]["remove_presence_listener"] = (
             async_track_state_change_event(

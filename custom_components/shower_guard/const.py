@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 1.5.0
+# version: 1.6.0
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # Session Detection (v1.5, ADR-0004)
 # Session start is relative to a tracked ambient baseline, not a flat
@@ -27,9 +27,31 @@ DEFAULT_BASELINE_TIME_CONSTANT_SECONDS: float = 600.0  # 10 minutes
 CONF_BASELINE_TIME_CONSTANT_SECONDS = "baseline_time_constant_seconds"
 
 # How long (seconds) humidity must stay below the session's frozen start
-# threshold before a session is considered ended. Prevents false endings
-# from brief dips. (Hysteresis behavior only — not a trigger level.)
+# threshold before a session is considered ended, if neither of the faster
+# ADR-0005 paths below fires first. This is the stable/flat-humidity
+# fallback — a session that isn't clearly declining (and has no presence
+# confirmation) still ends once this elapses.
 DEFAULT_COOLDOWN_SECONDS: int = 300  # 5 minutes
+
+# Session End Confirmation (v1.6, ADR-0005)
+# Points humidity must have fallen from the session's peak before it counts
+# as "declining" for either of the two faster end-of-session paths below.
+DEFAULT_HUMIDITY_DECLINE_DELTA: float = 1.0
+CONF_HUMIDITY_DECLINE_DELTA = "humidity_decline_delta"
+
+# How long (seconds) a decline must hold continuously, absent any presence
+# corroboration, before it ends the session on its own. Without this, a
+# single noisy reading (a stray dip, a brief fan cycle) could end a session
+# that's still genuinely running.
+DEFAULT_DECLINE_CONFIRM_SECONDS: float = 60.0
+CONF_DECLINE_CONFIRM_SECONDS = "decline_confirm_seconds"
+
+# How long (seconds) presence must have read continuously False before a
+# concurrent decline is trusted enough to end the session immediately (no
+# separate decline-hold window is required in this path — presence itself
+# is the corroboration). Only relevant when presence_sensor is configured.
+DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS: float = 60.0
+CONF_PRESENCE_CLEAR_CONFIRM_SECONDS = "presence_clear_confirm_seconds"
 
 # configuration.yaml keys (Sensor Layer wiring)
 CONF_HUMIDITY_SENSOR = "humidity_sensor"

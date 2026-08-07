@@ -1,7 +1,7 @@
 # Shower Guard — Backlog
 
-Features deferred beyond the current roadmap. All milestones through v1.5
-(Dynamic Baseline Session Start) are complete — remaining work lives here
+Features deferred beyond the current roadmap. All milestones through v1.6
+(Decline-Confirmed Session End) are complete — remaining work lives here
 until scheduled.
 
 ---
@@ -47,6 +47,22 @@ until scheduled.
   `decision.py`/`const.py` only — orthogonal to ADR-0004's session-start
   change and to ADR-0003's presence-confirmation gate, both of which stay as
   they are.
+
+### Rolling-Slope Trend Detection for Session End
+- **Reason deferred:** ADR-0005 uses a simpler peak-relative decline
+  (`peak_humidity - humidity >= humidity_decline_delta`, sustained for
+  `decline_confirm_seconds`) rather than a true rolling-window linear-fit
+  slope. The simpler approach already fixed the logged "stuck two hours in
+  Running" case; a regression-based trend detector adds real complexity
+  (window sizing, minimum sample count, handling irregular push intervals)
+  that isn't justified without more real sessions showing the peak-relative
+  approach is too coarse.
+- **Target version:** Revisit once several more real sessions are logged
+  and replayed, especially any with a genuinely noisy or double-peaked
+  decay curve the current approach handles poorly.
+- **Notes:** Scoped to `session.py`'s `_from_cooldown` only if picked up —
+  orthogonal to the dynamic baseline (ADR-0004) and presence-confirmation
+  gate on the delta cutoff (ADR-0003), both of which stay as they are.
 
 ---
 

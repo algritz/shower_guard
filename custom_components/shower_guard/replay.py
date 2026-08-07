@@ -3,7 +3,7 @@
 #          optionally presence) readings through the exact same Session
 #          Detection and Decision Engine classes used in production. No
 #          decision logic is duplicated here.
-# version: 1.4.0
+# version: 1.5.0
 # note:    Pure Python. No Home Assistant imports. Keep lightweight per
 #          ADR-0001. Runnable standalone:
 #          `python -m custom_components.shower_guard.replay <csv-file>`.
@@ -21,8 +21,11 @@ from .const import (
     DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DECISION_LOG_SIZE,
+    DEFAULT_DECLINE_CONFIRM_SECONDS,
+    DEFAULT_HUMIDITY_DECLINE_DELTA,
     DEFAULT_HUMIDITY_START_DELTA,
     DEFAULT_MAX_HUMIDITY_DELTA,
+    DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
     DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
 )
 from .decision import DecisionEngine, DecisionLog
@@ -45,6 +48,9 @@ def replay(
     humidity_start_delta: float = DEFAULT_HUMIDITY_START_DELTA,
     cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
     baseline_time_constant_seconds: float = DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+    humidity_decline_delta: float = DEFAULT_HUMIDITY_DECLINE_DELTA,
+    decline_confirm_seconds: float = DEFAULT_DECLINE_CONFIRM_SECONDS,
+    presence_clear_confirm_seconds: float = DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
     max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
     max_session_seconds: Optional[float] = None,
     presence_confirmation_window_seconds: float = DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
@@ -66,11 +72,17 @@ def replay(
     cuts never confirm — matching production behavior with no
     ``presence_sensor`` configured. Both sequences must independently be
     sorted oldest-first; they don't need matching timestamps or lengths.
+    The current presence value is also fed into ``SessionDetector.update()``
+    on every reading (see ADR-0005), so a presence-confirmed session end can
+    be exercised in replay the same way it fires in production.
     """
     detector = SessionDetector(
         humidity_start_delta=humidity_start_delta,
         cooldown_seconds=cooldown_seconds,
         baseline_time_constant_seconds=baseline_time_constant_seconds,
+        humidity_decline_delta=humidity_decline_delta,
+        decline_confirm_seconds=decline_confirm_seconds,
+        presence_clear_confirm_seconds=presence_clear_confirm_seconds,
     )
     engine = DecisionEngine(
         max_humidity_delta=max_humidity_delta,
@@ -94,7 +106,7 @@ def replay(
                 last_presence_at = event_time
             presence_idx += 1
 
-        change = detector.update(humidity=humidity, now=now)
+        change = detector.update(humidity=humidity, now=now, presence=current_presence)
         if change is not None:
             result.state_changes.append(change)
 
@@ -178,6 +190,19 @@ def _main() -> None:
         default=DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
     )
     parser.add_argument(
+        "--humidity-decline-delta", type=float, default=DEFAULT_HUMIDITY_DECLINE_DELTA
+    )
+    parser.add_argument(
+        "--decline-confirm-seconds",
+        type=float,
+        default=DEFAULT_DECLINE_CONFIRM_SECONDS,
+    )
+    parser.add_argument(
+        "--presence-clear-confirm-seconds",
+        type=float,
+        default=DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
+    )
+    parser.add_argument(
         "--max-humidity-delta", type=float, default=DEFAULT_MAX_HUMIDITY_DELTA
     )
     parser.add_argument(
@@ -202,6 +227,9 @@ def _main() -> None:
         humidity_start_delta=args.humidity_start_delta,
         cooldown_seconds=args.cooldown_seconds,
         baseline_time_constant_seconds=args.baseline_time_constant_seconds,
+        humidity_decline_delta=args.humidity_decline_delta,
+        decline_confirm_seconds=args.decline_confirm_seconds,
+        presence_clear_confirm_seconds=args.presence_clear_confirm_seconds,
         max_humidity_delta=args.max_humidity_delta,
         max_session_seconds=args.max_session_seconds,
         presence_confirmation_window_seconds=args.presence_confirmation_window_seconds,

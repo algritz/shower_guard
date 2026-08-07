@@ -2,9 +2,10 @@
 # purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
 #          -> DecisionLog wiring (v0.2/v0.3/v0.4), the actuator script wiring
 #          (v1.0), the humidity-delta cutoff gated by presence confirmation
-#          (v1.4, ADR-0003), and the duration fallback (independent of
-#          presence, off unless explicitly configured).
-# version: 1.4.0
+#          (v1.4, ADR-0003), the duration fallback (independent of presence,
+#          off unless explicitly configured), and decline/presence-confirmed
+#          session end (v1.6, ADR-0005).
+# version: 1.6.0
 # ---
 
 import asyncio
@@ -616,6 +617,91 @@ def test_no_presence_listener_when_not_configured():
 
 
 # ---------------------------------------------------------------------------
+# Session end confirmation (v1.6 — decline + presence, ADR-0005)
+# ---------------------------------------------------------------------------
+
+def test_presence_clear_ends_a_declining_session_without_a_new_humidity_reading():
+    """A presence-clear event alone — no new humidity reading — can end an
+    already-declining session, by re-running Session Detection against the
+    last known humidity. presence_clear_confirm_seconds=0 isolates this from
+    real-time timing flakiness in the test."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                    "presence_clear_confirm_seconds": 0,
+                }
+            },
+        )
+    )
+
+    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+
+    # Settle the ambient baseline, then trigger a session with a fast rise.
+    for state in ("58.0", "58.0", "61.5"):
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+        asyncio.run(humidity_callback(event))
+
+    detector = hass.data[DOMAIN]["detector"]
+    assert detector.state is SessionState.ACTIVE
+
+    # Humidity drops back toward ambient -> COOLDOWN, with a clear decline
+    # from peak (~3.5pts, above the default 1.0 humidity_decline_delta).
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
+    asyncio.run(humidity_callback(event))
+    assert detector.state is SessionState.COOLDOWN
+
+    # No new humidity reading arrives — only presence clearing. With
+    # presence_clear_confirm_seconds=0, that's enough to confirm immediately.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
+    asyncio.run(presence_callback(event))
+
+    assert detector.state is SessionState.IDLE
+
+
+def test_presence_true_does_not_end_a_declining_session_via_wiring():
+    """The same decline, with presence reporting True instead, does not end
+    the session through this path."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                    "presence_clear_confirm_seconds": 0,
+                }
+            },
+        )
+    )
+
+    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+
+    for state in ("58.0", "58.0", "61.5", "58.0"):
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+        asyncio.run(humidity_callback(event))
+
+    detector = hass.data[DOMAIN]["detector"]
+    assert detector.state is SessionState.COOLDOWN
+
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
+    asyncio.run(presence_callback(event))
+
+    assert detector.state is SessionState.COOLDOWN
+
+
+# ---------------------------------------------------------------------------
 # Actuator wiring (v1.0 — real HA script calls on a decision change)
 # ---------------------------------------------------------------------------
 
@@ -1182,6 +1268,8 @@ if __name__ == "__main__":
         test_presence_flicker_off_within_window_still_cuts,
         test_presence_callback_ignores_unknown_state,
         test_no_presence_listener_when_not_configured,
+        test_presence_clear_ends_a_declining_session_without_a_new_humidity_reading,
+        test_presence_true_does_not_end_a_declining_session_via_wiring,
         test_actuator_not_called_when_no_scripts_configured,
         test_actuator_called_on_water_available_decision,
         test_actuator_called_on_water_cut_decision,

@@ -1,0 +1,1159 @@
+From f236af04a734a00b5cd6c1529a7d71cde2095852 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.local>
+Date: Fri, 7 Aug 2026 10:57:21 +0000
+Subject: [PATCH] ADR-0005: decline-confirmed session end, gated by presence
+ when available
+
+Session end (COOLDOWN -> ENDED) no longer relies solely on the elapsed
+cooldown timer. It now fires on the first of:
+
+1. Humidity down humidity_decline_delta from the session's peak AND
+   presence continuously False for presence_clear_confirm_seconds
+   (fastest path, requires a presence sensor).
+2. The same decline sustained for decline_confirm_seconds, no presence
+   required.
+3. cooldown_seconds elapsed (unchanged fallback for flat/stable humidity).
+
+Fixes a case where ADR-0004's lower, ambient-relative session_start_threshold
+let a long, shallow humidity decay tail keep re-crossing the threshold and
+resetting the cooldown timer, leaving the session's binary_sensor stuck 'on'
+for over two hours after the shower actually ended.
+
+- const.py: new humidity_decline_delta / decline_confirm_seconds /
+  presence_clear_confirm_seconds constants (v1.6.0).
+- session.py: track peak_humidity, decline/presence-clear timers;
+  update() gains optional presence param; _from_cooldown implements the
+  three-path check. decision.py is untouched (ADR-0001 layer separation).
+- __init__.py: pass presence into detector.update(); presence-change
+  callback re-runs Session Detection against the last known humidity so a
+  declining session can end immediately on a presence-clear event.
+- replay.py: threads presence into detector.update(); new CLI flags.
+- Tests: 9 new tests across test_session.py and test_init.py. Full suite:
+  105 passed (96 previously passing + 9 new).
+- README.md / BACKLOG.md updated.
+
+See adr/ADR-0005-decline-confirmed-session-end.md for full rationale.
+---
+ BACKLOG.md                                    |  20 +-
+ README.md                                     |  30 ++-
+ adr/ADR-0005-decline-confirmed-session-end.md | 159 ++++++++++++++++
+ custom_components/shower_guard/__init__.py    |  46 ++++-
+ custom_components/shower_guard/const.py       |  30 ++-
+ custom_components/shower_guard/manifest.json  |   2 +-
+ custom_components/shower_guard/replay.py      |  32 +++-
+ custom_components/shower_guard/session.py     | 129 +++++++++++--
+ tests/test_init.py                            |  94 +++++++++-
+ tests/test_session.py                         | 177 +++++++++++++++++-
+ 10 files changed, 686 insertions(+), 33 deletions(-)
+ create mode 100644 adr/ADR-0005-decline-confirmed-session-end.md
+
+diff --git a/BACKLOG.md b/BACKLOG.md
+index 6452e47..b13970e 100644
+--- a/BACKLOG.md
++++ b/BACKLOG.md
+@@ -1,7 +1,7 @@
+ # Shower Guard — Backlog
+ 
+-Features deferred beyond the current roadmap. All milestones through v1.5
+-(Dynamic Baseline Session Start) are complete — remaining work lives here
++Features deferred beyond the current roadmap. All milestones through v1.6
++(Decline-Confirmed Session End) are complete — remaining work lives here
+ until scheduled.
+ 
+ ---
+@@ -48,6 +48,22 @@ until scheduled.
+   change and to ADR-0003's presence-confirmation gate, both of which stay as
+   they are.
+ 
++### Rolling-Slope Trend Detection for Session End
++- **Reason deferred:** ADR-0005 uses a simpler peak-relative decline
++  (`peak_humidity - humidity >= humidity_decline_delta`, sustained for
++  `decline_confirm_seconds`) rather than a true rolling-window linear-fit
++  slope. The simpler approach already fixed the logged "stuck two hours in
++  Running" case; a regression-based trend detector adds real complexity
++  (window sizing, minimum sample count, handling irregular push intervals)
++  that isn't justified without more real sessions showing the peak-relative
++  approach is too coarse.
++- **Target version:** Revisit once several more real sessions are logged
++  and replayed, especially any with a genuinely noisy or double-peaked
++  decay curve the current approach handles poorly.
++- **Notes:** Scoped to `session.py`'s `_from_cooldown` only if picked up —
++  orthogonal to the dynamic baseline (ADR-0004) and presence-confirmation
++  gate on the delta cutoff (ADR-0003), both of which stay as they are.
++
+ ---
+ 
+ ## Format
+diff --git a/README.md b/README.md
+index 15e6a96..78f3b44 100644
+--- a/README.md
++++ b/README.md
+@@ -34,6 +34,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ | v1.3    | Live Baseline Humidity Entity | ✅ Done |
+ | v1.4    | Presence Confirmation Gate (ADR-0003) | ✅ Done |
+ | v1.5    | Dynamic Baseline Session Start (ADR-0004) | ✅ Done |
++| v1.6    | Decline-Confirmed Session End (ADR-0005) | ✅ Done |
+ 
+ ## Installation
+ 
+@@ -41,7 +42,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ 2. Restart Home Assistant.
+ 3. Configure via `configuration.yaml` (see below).
+ 
+-## Configuration (v1.5)
++## Configuration (v1.6)
+ 
+ ```yaml
+ shower_guard:
+@@ -49,7 +50,10 @@ shower_guard:
+   presence_sensor: binary_sensor.bathroom_presence    # optional — 'on'/'off' presence entity
+   humidity_start_delta: 3.0                           # optional — default 3.0 (points above ambient baseline that trigger a session)
+   baseline_time_constant_seconds: 600                 # optional — default 600 (10 min EMA time constant for the ambient baseline)
+-  cooldown_seconds: 300                               # optional — default 300 (5 min)
++  cooldown_seconds: 300                               # optional — default 300 (5 min; stable/flat-humidity fallback, see ADR-0005)
++  humidity_decline_delta: 1.0                          # optional — default 1.0 (points below session peak that count as "declining", ADR-0005)
++  decline_confirm_seconds: 60                          # optional — default 60s (sustained decline required with no presence data, ADR-0005)
++  presence_clear_confirm_seconds: 60                   # optional — default 60s (sustained presence-clear that fast-ends a declining session, ADR-0005)
+   max_humidity_delta: 15.0                             # optional — default 15.0 (percentage points RH)
+   presence_confirmation_window_seconds: 60             # optional — default 60s (see ADR-0003)
+   max_session_seconds: 900                             # optional — off by default; independent of presence_sensor
+@@ -119,6 +123,25 @@ full rationale). If `presence_sensor` is not configured, or its state is
+ `unknown`/`unavailable`, the delta policy never confirms — configure
+ `max_session_seconds` as a fallback in that case.
+ 
++**Decline-confirmed session end (v1.6, ADR-0005):** once a session enters the
++post-threshold cooldown window, it now ends on whichever of these fires
++first, instead of purely waiting out `cooldown_seconds`:
++
++1. Humidity has fallen `humidity_decline_delta` points from the session's
++   peak **and** presence has read continuously `False` for
++   `presence_clear_confirm_seconds` — the fastest path, when a presence
++   sensor is configured.
++2. The same decline has held continuously for `decline_confirm_seconds`,
++   with no presence data required.
++3. `cooldown_seconds` has elapsed with neither of the above true — the
++   original "stable/flat humidity" fallback, unchanged.
++
++This fixes a case where a session's binary sensor stayed `on` for over two
++hours during a long, slow humidity decay: ADR-0004's lower, ambient-relative
++threshold made it easy for a shallow decay tail to keep re-crossing the
++threshold and resetting the cooldown timer. See ADR-0005 for the full
++rationale.
++
+ **Decision Logging (v0.4):** every Decision Engine evaluation — not just
+ changes — is recorded into a bounded, in-memory `DecisionLog`
+ (`decision_log_size` entries, oldest dropped first). This gives a structured
+@@ -140,6 +163,9 @@ python -m custom_components.shower_guard.replay readings.csv \
+   --humidity-start-delta 3.0 \
+   --baseline-time-constant-seconds 600 \
+   --cooldown-seconds 300 \
++  --humidity-decline-delta 1.0 \
++  --decline-confirm-seconds 60 \
++  --presence-clear-confirm-seconds 60 \
+   --max-humidity-delta 15.0 \
+   --presence-confirmation-window-seconds 60 \
+   --max-session-seconds 900
+diff --git a/adr/ADR-0005-decline-confirmed-session-end.md b/adr/ADR-0005-decline-confirmed-session-end.md
+new file mode 100644
+index 0000000..12828e7
+--- /dev/null
++++ b/adr/ADR-0005-decline-confirmed-session-end.md
+@@ -0,0 +1,159 @@
++# ADR-0005 — Decline-Confirmed Session End (Trend, Gated by Presence When Available)
++
++| Field     | Value                    |
++|-----------|--------------------------|
++| Status    | Accepted                 |
++| Date      | 2026-08-07               |
++| Author    | Technical Lead           |
++
++---
++
++## Context
++
++Since v0.2, `SessionDetector` has ended a session (`COOLDOWN` → `ENDED`)
++purely on an elapsed timer: once humidity drops below the frozen
++`session_start_threshold`, the session ends `cooldown_seconds` (default 300s)
++later, unconditionally. ADR-0004 made the *start* trigger baseline-relative
++but left this end-of-session timer untouched.
++
++Real-world history logging surfaced a case where this interacts badly with
++ADR-0004's lower, ambient-relative threshold. A session peaked at ~83% RH and
++then decayed slowly over more than two hours, but `session_start_threshold`
++(baseline + 3.0 points, per ADR-0004) sat much lower than the old flat 75%
++floor — around 60% in this case. During a long decay tail, humidity
++re-crossed that lower threshold repeatedly on the way down, each crossing
++firing `RESUMED` and resetting `_cooldown_start`. `binary_sensor.shower_guard_
++session_active` stayed `on` for the entire two-hour decay, even though
++presence had gone `clear` and humidity had been falling since minutes after
++the peak. ADR-0004 made the start trigger more accurate at the cost of making
++the *hysteresis band it reuses for end-detection* easier to re-cross during a
++long, shallow decay — a side effect that ADR wasn't scoped to catch.
++
++The elapsed-timer approach also throws away two signals already available
++that indicate a session is genuinely over, not just paused:
++
++1. **Humidity trend.** A sustained decline from the session's peak is a
++   direct sign the room is drying out — stronger evidence than "still below
++   an arbitrary crossing point" and unrelated to where that point happens to
++   sit.
++2. **Presence**, when a sensor is configured. The bathroom being confirmed
++   empty is strong corroboration that a humidity decline reflects the room
++   clearing out, not sensor noise — and can end a session faster than
++   waiting out a fixed timer.
++
++## Decision
++
++`COOLDOWN` → `ENDED` now fires on the **first** of three conditions, checked
++in order, instead of solely on elapsed time:
++
++1. **Decline + presence confirmed (fastest path, requires a presence
++   sensor).** Humidity has fallen `humidity_decline_delta` points (default
++   1.0) or more from the session's peak, **and** presence has been
++   continuously `False` for at least `presence_clear_confirm_seconds`
++   (default 60s). No additional decline debounce is applied here — presence
++   corroboration already filters out spurious single-reading dips, and this
++   path exists specifically to be fast.
++2. **Sustained decline alone (no presence sensor required).** Humidity has
++   fallen `humidity_decline_delta` points or more from the peak, and that
++   decline has held continuously for at least `decline_confirm_seconds`
++   (default 60s). This is the path for deployments without a presence
++   sensor, or where presence is still `True`/unknown. The sustain window
++   exists because, without presence corroborating it, a single noisy dip
++   (a stray reading, a brief fan cycle) must not be allowed to end a session
++   that's still running.
++3. **Stable/elapsed-timeout fallback (existing behavior, unchanged
++   trigger).** If neither of the above fires — humidity is flat rather than
++   declining, or is oscillating without a sustained trend — `cooldown_seconds`
++   elapsed since entering `COOLDOWN` still ends the session, exactly as
++   before. This is what actually implements "stable for 5 minutes ⇒ over"
++   for the no-presence, no-clear-decline case: if humidity isn't declining
++   and isn't rising back above the threshold, it's flat, and the existing
++   timer already captures that.
++
++The session's **peak humidity** since `active_since` is now tracked
++(`_peak_humidity`), reset the same way `active_since_humidity` already is —
++frozen relative to the current session, reset to the raw reading on
++`RESUMED` so a sibling's fresh shower isn't measured against the previous
++person's peak.
++
++`SessionDetector.update()` gains an optional `presence: Optional[bool] =
++None` parameter, mirroring how `presence` already flows into
++`DecisionEngine.evaluate()`. This is the one deliberate crossing of
++previously-separate data: presence was Decision Engine input only before
++this ADR. It remains a plain `bool`/`None` value passed in by the wiring
++layer — `session.py` gains no HA imports and stays a pure computation,
++satisfying ADR-0001's constraint even though presence's *scope* changes.
++
++### What changes
++
++| File           | Change                                                                 |
++|----------------|-------------------------------------------------------------------------|
++| `const.py`     | Add `CONF_HUMIDITY_DECLINE_DELTA` / `DEFAULT_HUMIDITY_DECLINE_DELTA` (1.0), `CONF_DECLINE_CONFIRM_SECONDS` / `DEFAULT_DECLINE_CONFIRM_SECONDS` (60.0), `CONF_PRESENCE_CLEAR_CONFIRM_SECONDS` / `DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS` (60.0). |
++| `session.py`   | Track `_peak_humidity`, `_decline_since`, `_presence_clear_since`. `update()` gains optional `presence`. `_from_cooldown` implements the three-condition check above instead of elapsed-time-only. `decision.py` is untouched — this ADR is scoped entirely to Session Detection's end trigger, same boundary ADR-0004 drew for the start trigger. |
++| `__init__.py`  | Pass `hass.data[DOMAIN]["presence"]` into `detector.update()` on every humidity reading. The presence callback now also re-runs `detector.update()` against the last known humidity (mirroring how it already re-runs `_evaluate_and_record` for the Decision Engine), so a session can end immediately when presence clears mid-decline rather than waiting for the next humidity push. |
++| `replay.py`    | Thread `current_presence` (already tracked for `DecisionEngine.evaluate()`) into `detector.update()` too. New optional `replay()` parameters and CLI flags for the three new constants. |
++| Tests          | New tests in `test_session.py` covering decline-only end, presence-confirmed fast end, single-dip noise *not* ending a session, and peak-reset on `RESUMED`. `test_init.py` gains a test that a presence-clear event alone (no new humidity reading) can end an already-declining session. `test_replay.py` unaffected defaults verified to still pass unchanged. |
++
++### Configuration
++
++```yaml
++shower_guard:
++  humidity_sensor: sensor.bathroom_humidity
++  presence_sensor: binary_sensor.bathroom_presence   # optional, as before
++  humidity_decline_delta: 1.0                        # optional — default 1.0
++  decline_confirm_seconds: 60                        # optional — default 60
++  presence_clear_confirm_seconds: 60                 # optional — default 60
++  cooldown_seconds: 300                              # unchanged — now the stable/timeout fallback only
++```
++
++## Consequences
++
++- Sessions end sooner, and more accurately, once a real decline is
++  underway — the two-hour "stuck Running" case this ADR was written to fix
++  no longer occurs, since sustained decline (with or without presence) now
++  beats waiting out the full `cooldown_seconds` timer.
++- Without a presence sensor, ending still requires a *sustained* decline
++  (`decline_confirm_seconds`), not an instantaneous one — a single noisy
++  reading cannot end a session on its own. This is strictly more permissive
++  than the old pure-timer behavior for a genuinely declining session, and
++  identical for a flat/oscillating one (path 3 still applies).
++- `SessionDetector.update()`'s signature grows by one optional, backward-
++  compatible parameter. Existing callers that don't pass `presence` behave
++  exactly as if no presence sensor were configured (path 1 above can never
++  fire; paths 2 and 3 are unaffected by this change on their own).
++- Presence's role now spans two files instead of one (`session.py` in
++  addition to `decision.py`). Both consume it as a plain `Optional[bool]`
++  with no HA import, so ADR-0001's pure-layer constraint holds — but a
++  reader auditing "where does presence matter" now needs to check both
++  files instead of one.
++- The `RESUMED` reset now also clears `_peak_humidity`, `_decline_since`,
++  and `_presence_clear_since`, alongside the existing `active_since_humidity`
++  reset — consistent with the existing "sibling shower gets a fresh
++  baseline" behavior, extended to the new tracked state.
++
++## Alternatives Considered
++
++- **Feed presence into `session.py` only via a rolling regression /
++  linear-fit slope instead of peak-relative decline** — Rejected for now.
++  A true rolling-slope trend detector is more robust to noise but adds real
++  complexity (window sizing, minimum sample count) for a problem the
++  simpler peak-relative-plus-sustain-window approach already solves given
++  the logged data. Left as a possible future refinement if peak-relative
++  decline proves too coarse once more real sessions are captured — tracked
++  in `BACKLOG.md`.
++- **Drop the elapsed-timer fallback entirely, always require decline or
++  presence** — Rejected. A session where humidity plateaus without clearly
++  declining (e.g. a slow-draining, well-ventilated bathroom) would then
++  never end. The timer remains the guaranteed backstop.
++- **Apply the same fast paths while still `ACTIVE`, not just in
++  `COOLDOWN`** — Rejected. `ACTIVE` → `COOLDOWN` already requires dropping
++  below the frozen `session_start_threshold`; layering decline/presence
++  checks on top of `ACTIVE` as well would let a session end without ever
++  entering `COOLDOWN`, changing the state machine's shape for no clear
++  benefit — the reported problem is specifically about time spent stuck in
++  `COOLDOWN`.
++- **Presence-clear alone (no decline requirement) ends a session** —
++  Rejected. Presence sensors can read `False` while someone is genuinely
++  still showering behind a closed curtain/door depending on placement;
++  requiring the decline alongside presence keeps humidity as the primary
++  signal and presence as corroboration, not a substitute.
+diff --git a/custom_components/shower_guard/__init__.py b/custom_components/shower_guard/__init__.py
+index d897fcf..fdce459 100644
+--- a/custom_components/shower_guard/__init__.py
++++ b/custom_components/shower_guard/__init__.py
+@@ -1,6 +1,6 @@
+ # ---
+ # purpose: Home Assistant integration entry point for Shower Guard.
+-# version: 1.4.0
++# version: 1.6.0
+ # note: Wires the Sensor Layer (humidity entity, optional presence entity)
+ #       into Session Detection and the Decision Engine, records every
+ #       decision into a bounded DecisionLog, and — when configured — calls
+@@ -13,7 +13,10 @@
+ #       presence was seen True so brief mmWave dropouts within the
+ #       confirmation window don't defeat a real cutoff. The optional
+ #       duration fallback (max_session_seconds) is independent of presence
+-#       and disabled unless explicitly configured.
++#       and disabled unless explicitly configured. Presence is also now fed
++#       into Session Detection itself (see ADR-0005), so a session already
++#       declining can end as soon as presence clears rather than only on
++#       the next humidity reading or the cooldown timer.
+ # ---
+ 
+ import logging
+@@ -28,11 +31,14 @@ from .const import (
+     CONF_BASELINE_TIME_CONSTANT_SECONDS,
+     CONF_COOLDOWN_SECONDS,
+     CONF_DECISION_LOG_SIZE,
++    CONF_DECLINE_CONFIRM_SECONDS,
++    CONF_HUMIDITY_DECLINE_DELTA,
+     CONF_HUMIDITY_SENSOR,
+     CONF_HUMIDITY_START_DELTA,
+     CONF_MAX_HUMIDITY_DELTA,
+     CONF_MAX_SESSION_SECONDS,
+     CONF_NOTIFY_SERVICE,
++    CONF_PRESENCE_CLEAR_CONFIRM_SECONDS,
+     CONF_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+     CONF_PRESENCE_SENSOR,
+     CONF_WATER_AVAILABLE_SCRIPT,
+@@ -40,9 +46,12 @@ from .const import (
+     DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+     DEFAULT_COOLDOWN_SECONDS,
+     DEFAULT_DECISION_LOG_SIZE,
++    DEFAULT_DECLINE_CONFIRM_SECONDS,
++    DEFAULT_HUMIDITY_DECLINE_DELTA,
+     DEFAULT_HUMIDITY_START_DELTA,
+     DEFAULT_MAX_HUMIDITY_DELTA,
+     DEFAULT_MAX_SESSION_SECONDS,
++    DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
+     DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+     DOMAIN,
+     ENTITY_ID_HUMIDITY_DELTA,
+@@ -93,6 +102,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+         baseline_time_constant_seconds=domain_config.get(
+             CONF_BASELINE_TIME_CONSTANT_SECONDS, DEFAULT_BASELINE_TIME_CONSTANT_SECONDS
+         ),
++        humidity_decline_delta=domain_config.get(
++            CONF_HUMIDITY_DECLINE_DELTA, DEFAULT_HUMIDITY_DECLINE_DELTA
++        ),
++        decline_confirm_seconds=domain_config.get(
++            CONF_DECLINE_CONFIRM_SECONDS, DEFAULT_DECLINE_CONFIRM_SECONDS
++        ),
++        presence_clear_confirm_seconds=domain_config.get(
++            CONF_PRESENCE_CLEAR_CONFIRM_SECONDS, DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS
++        ),
+     )
+ 
+     presence_sensor = domain_config.get(CONF_PRESENCE_SENSOR)
+@@ -261,7 +279,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+         now = datetime.now()
+         hass.data[DOMAIN]["last_humidity"] = humidity
+ 
+-        change = detector.update(humidity=humidity, now=now)
++        change = detector.update(
++            humidity=humidity, now=now, presence=hass.data[DOMAIN]["presence"]
++        )
+         if change is not None:
+             _LOGGER.info("Shower Guard: %s", change)
+ 
+@@ -278,8 +298,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+             True — the timestamp it was last confirmed, so a delta-triggered
+             cutoff can still fire on the next humidity reading even if
+             presence has since flickered off (see ADR-0003's confirmation
+-            window). Also immediately re-evaluates, since presence changing
+-            can flip a cutoff decision without waiting on humidity."""
++            window). Also re-runs Session Detection against the last known
++            humidity reading (see ADR-0005) so a session already declining
++            can end the moment presence is confirmed clear, rather than
++            waiting for the next humidity push — then immediately
++            re-evaluates the Decision Engine, since presence changing can
++            also flip a cutoff decision without waiting on humidity."""
+             new_state = event.data.get("new_state")
+             if new_state is None:
+                 return
+@@ -291,7 +315,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+             hass.data[DOMAIN]["presence"] = presence
+             if presence is True:
+                 hass.data[DOMAIN]["last_presence_at"] = datetime.now()
+-            await _evaluate_and_record(datetime.now())
++
++            now = datetime.now()
++            last_humidity = hass.data[DOMAIN]["last_humidity"]
++            if last_humidity is not None:
++                change = detector.update(
++                    humidity=last_humidity, now=now, presence=presence
++                )
++                if change is not None:
++                    _LOGGER.info("Shower Guard: %s", change)
++
++            await _evaluate_and_record(now)
+ 
+         hass.data[DOMAIN]["remove_presence_listener"] = (
+             async_track_state_change_event(
+diff --git a/custom_components/shower_guard/const.py b/custom_components/shower_guard/const.py
+index ce3f8ff..a25b587 100644
+--- a/custom_components/shower_guard/const.py
++++ b/custom_components/shower_guard/const.py
+@@ -1,11 +1,11 @@
+ # ---
+ # purpose: Central constants for the Shower Guard integration.
+-# version: 1.5.0
++# version: 1.6.0
+ # note: Add new constants here. Never scatter magic strings across modules.
+ # ---
+ 
+ DOMAIN = "shower_guard"
+-VERSION = "1.5.0"
++VERSION = "1.6.0"
+ 
+ # Session Detection (v1.5, ADR-0004)
+ # Session start is relative to a tracked ambient baseline, not a flat
+@@ -27,10 +27,32 @@ DEFAULT_BASELINE_TIME_CONSTANT_SECONDS: float = 600.0  # 10 minutes
+ CONF_BASELINE_TIME_CONSTANT_SECONDS = "baseline_time_constant_seconds"
+ 
+ # How long (seconds) humidity must stay below the session's frozen start
+-# threshold before a session is considered ended. Prevents false endings
+-# from brief dips. (Hysteresis behavior only — not a trigger level.)
++# threshold before a session is considered ended, if neither of the faster
++# ADR-0005 paths below fires first. This is the stable/flat-humidity
++# fallback — a session that isn't clearly declining (and has no presence
++# confirmation) still ends once this elapses.
+ DEFAULT_COOLDOWN_SECONDS: int = 300  # 5 minutes
+ 
++# Session End Confirmation (v1.6, ADR-0005)
++# Points humidity must have fallen from the session's peak before it counts
++# as "declining" for either of the two faster end-of-session paths below.
++DEFAULT_HUMIDITY_DECLINE_DELTA: float = 1.0
++CONF_HUMIDITY_DECLINE_DELTA = "humidity_decline_delta"
++
++# How long (seconds) a decline must hold continuously, absent any presence
++# corroboration, before it ends the session on its own. Without this, a
++# single noisy reading (a stray dip, a brief fan cycle) could end a session
++# that's still genuinely running.
++DEFAULT_DECLINE_CONFIRM_SECONDS: float = 60.0
++CONF_DECLINE_CONFIRM_SECONDS = "decline_confirm_seconds"
++
++# How long (seconds) presence must have read continuously False before a
++# concurrent decline is trusted enough to end the session immediately (no
++# separate decline-hold window is required in this path — presence itself
++# is the corroboration). Only relevant when presence_sensor is configured.
++DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS: float = 60.0
++CONF_PRESENCE_CLEAR_CONFIRM_SECONDS = "presence_clear_confirm_seconds"
++
+ # configuration.yaml keys (Sensor Layer wiring)
+ CONF_HUMIDITY_SENSOR = "humidity_sensor"
+ CONF_COOLDOWN_SECONDS = "cooldown_seconds"
+diff --git a/custom_components/shower_guard/manifest.json b/custom_components/shower_guard/manifest.json
+index 754b3c6..9f69c4e 100644
+--- a/custom_components/shower_guard/manifest.json
++++ b/custom_components/shower_guard/manifest.json
+@@ -1,7 +1,7 @@
+ {
+ 	"domain": "shower_guard",
+ 	"name": "Shower Guard",
+-	"version": "1.5.0",
++	"version": "1.6.0",
+ 	"documentation": "https://github.com/algritz/shower_guard",
+ 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
+ 	"dependencies": [],
+diff --git a/custom_components/shower_guard/replay.py b/custom_components/shower_guard/replay.py
+index 923c62e..c8ac925 100644
+--- a/custom_components/shower_guard/replay.py
++++ b/custom_components/shower_guard/replay.py
+@@ -3,7 +3,7 @@
+ #          optionally presence) readings through the exact same Session
+ #          Detection and Decision Engine classes used in production. No
+ #          decision logic is duplicated here.
+-# version: 1.4.0
++# version: 1.5.0
+ # note:    Pure Python. No Home Assistant imports. Keep lightweight per
+ #          ADR-0001. Runnable standalone:
+ #          `python -m custom_components.shower_guard.replay <csv-file>`.
+@@ -21,8 +21,11 @@ from .const import (
+     DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+     DEFAULT_COOLDOWN_SECONDS,
+     DEFAULT_DECISION_LOG_SIZE,
++    DEFAULT_DECLINE_CONFIRM_SECONDS,
++    DEFAULT_HUMIDITY_DECLINE_DELTA,
+     DEFAULT_HUMIDITY_START_DELTA,
+     DEFAULT_MAX_HUMIDITY_DELTA,
++    DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
+     DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+ )
+ from .decision import DecisionEngine, DecisionLog
+@@ -45,6 +48,9 @@ def replay(
+     humidity_start_delta: float = DEFAULT_HUMIDITY_START_DELTA,
+     cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+     baseline_time_constant_seconds: float = DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
++    humidity_decline_delta: float = DEFAULT_HUMIDITY_DECLINE_DELTA,
++    decline_confirm_seconds: float = DEFAULT_DECLINE_CONFIRM_SECONDS,
++    presence_clear_confirm_seconds: float = DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
+     max_humidity_delta: float = DEFAULT_MAX_HUMIDITY_DELTA,
+     max_session_seconds: Optional[float] = None,
+     presence_confirmation_window_seconds: float = DEFAULT_PRESENCE_CONFIRMATION_WINDOW_SECONDS,
+@@ -66,11 +72,17 @@ def replay(
+     cuts never confirm — matching production behavior with no
+     ``presence_sensor`` configured. Both sequences must independently be
+     sorted oldest-first; they don't need matching timestamps or lengths.
++    The current presence value is also fed into ``SessionDetector.update()``
++    on every reading (see ADR-0005), so a presence-confirmed session end can
++    be exercised in replay the same way it fires in production.
+     """
+     detector = SessionDetector(
+         humidity_start_delta=humidity_start_delta,
+         cooldown_seconds=cooldown_seconds,
+         baseline_time_constant_seconds=baseline_time_constant_seconds,
++        humidity_decline_delta=humidity_decline_delta,
++        decline_confirm_seconds=decline_confirm_seconds,
++        presence_clear_confirm_seconds=presence_clear_confirm_seconds,
+     )
+     engine = DecisionEngine(
+         max_humidity_delta=max_humidity_delta,
+@@ -94,7 +106,7 @@ def replay(
+                 last_presence_at = event_time
+             presence_idx += 1
+ 
+-        change = detector.update(humidity=humidity, now=now)
++        change = detector.update(humidity=humidity, now=now, presence=current_presence)
+         if change is not None:
+             result.state_changes.append(change)
+ 
+@@ -177,6 +189,19 @@ def _main() -> None:
+         type=float,
+         default=DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+     )
++    parser.add_argument(
++        "--humidity-decline-delta", type=float, default=DEFAULT_HUMIDITY_DECLINE_DELTA
++    )
++    parser.add_argument(
++        "--decline-confirm-seconds",
++        type=float,
++        default=DEFAULT_DECLINE_CONFIRM_SECONDS,
++    )
++    parser.add_argument(
++        "--presence-clear-confirm-seconds",
++        type=float,
++        default=DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
++    )
+     parser.add_argument(
+         "--max-humidity-delta", type=float, default=DEFAULT_MAX_HUMIDITY_DELTA
+     )
+@@ -202,6 +227,9 @@ def _main() -> None:
+         humidity_start_delta=args.humidity_start_delta,
+         cooldown_seconds=args.cooldown_seconds,
+         baseline_time_constant_seconds=args.baseline_time_constant_seconds,
++        humidity_decline_delta=args.humidity_decline_delta,
++        decline_confirm_seconds=args.decline_confirm_seconds,
++        presence_clear_confirm_seconds=args.presence_clear_confirm_seconds,
+         max_humidity_delta=args.max_humidity_delta,
+         max_session_seconds=args.max_session_seconds,
+         presence_confirmation_window_seconds=args.presence_confirmation_window_seconds,
+diff --git a/custom_components/shower_guard/session.py b/custom_components/shower_guard/session.py
+index d0bbd99..4613b90 100644
+--- a/custom_components/shower_guard/session.py
++++ b/custom_components/shower_guard/session.py
+@@ -1,9 +1,14 @@
+ # ---
+ # purpose: Session Detection layer — determines when a shower session starts,
+ #          continues, resumes, or ends based on humidity readings, using a
+-#          dynamic ambient baseline instead of a flat absolute threshold.
+-# version: 1.2.0 (integrated into repo v1.5.0, ADR-0004)
+-# note:    Pure Python. No Home Assistant imports. Safe to unit-test and replay.
++#          dynamic ambient baseline instead of a flat absolute threshold, and
++#          (as of ADR-0005) a decline-from-peak trend — optionally gated by
++#          presence — instead of relying solely on an elapsed cooldown timer
++#          to confirm the session actually ended.
++# version: 1.3.0 (integrated into repo v1.6.0, ADR-0005)
++# note:    Pure Python. No Home Assistant imports. Safe to unit-test and
++#          replay. ``presence`` is accepted as a plain Optional[bool] value
++#          the wiring layer already tracks — this file never touches HA.
+ # ---
+ 
+ from __future__ import annotations
+@@ -18,7 +23,10 @@ from typing import Optional
+ from .const import (
+     DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
+     DEFAULT_COOLDOWN_SECONDS,
++    DEFAULT_DECLINE_CONFIRM_SECONDS,
++    DEFAULT_HUMIDITY_DECLINE_DELTA,
+     DEFAULT_HUMIDITY_START_DELTA,
++    DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
+ )
+ 
+ _LOGGER = logging.getLogger(__name__)
+@@ -78,12 +86,25 @@ class SessionDetector:
+         IDLE ──[humidity - baseline >= start_delta]──► ACTIVE   (emit STARTED)
+         ACTIVE ──[humidity < frozen session_start_threshold]──► COOLDOWN
+         COOLDOWN ──[humidity >= frozen session_start_threshold]──► ACTIVE  (emit RESUMED)
+-        COOLDOWN ──[cooldown elapsed]──► IDLE                    (emit ENDED)
++        COOLDOWN ──[see below]──► IDLE                           (emit ENDED)
+ 
+     ``session_start_threshold`` (``baseline + start_delta`` at the moment the
+     session started) is frozen for the life of the session, giving the same
+     hysteresis behavior the old flat threshold provided for ACTIVE/COOLDOWN
+     transitions — only the *start* trigger is now baseline-relative.
++
++    Session end (v1.3, ADR-0005) is no longer purely a fixed timer. While in
++    COOLDOWN, ending fires on the first of:
++
++    1. Humidity has fallen ``humidity_decline_delta`` points from the
++       session's peak, AND presence has read continuously ``False`` for at
++       least ``presence_clear_confirm_seconds`` (fastest path — requires a
++       presence sensor).
++    2. The same decline has held continuously for at least
++       ``decline_confirm_seconds``, with no presence data required.
++    3. ``cooldown_seconds`` has elapsed since entering COOLDOWN (unchanged
++       fallback — the "flat/stable humidity" case where no clear decline is
++       detected).
+     """
+ 
+     def __init__(
+@@ -91,10 +112,16 @@ class SessionDetector:
+         humidity_start_delta: float = DEFAULT_HUMIDITY_START_DELTA,
+         cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+         baseline_time_constant_seconds: float = DEFAULT_BASELINE_TIME_CONSTANT_SECONDS,
++        humidity_decline_delta: float = DEFAULT_HUMIDITY_DECLINE_DELTA,
++        decline_confirm_seconds: float = DEFAULT_DECLINE_CONFIRM_SECONDS,
++        presence_clear_confirm_seconds: float = DEFAULT_PRESENCE_CLEAR_CONFIRM_SECONDS,
+     ) -> None:
+         self.humidity_start_delta = humidity_start_delta
+         self.cooldown_seconds = cooldown_seconds
+         self.baseline_time_constant_seconds = baseline_time_constant_seconds
++        self.humidity_decline_delta = humidity_decline_delta
++        self.decline_confirm_seconds = decline_confirm_seconds
++        self.presence_clear_confirm_seconds = presence_clear_confirm_seconds
+ 
+         self._state: SessionState = SessionState.IDLE
+         self._cooldown_start: Optional[datetime] = None
+@@ -105,6 +132,14 @@ class SessionDetector:
+         self._baseline_updated_at: Optional[datetime] = None
+         self._session_start_threshold: Optional[float] = None
+ 
++        # ADR-0005: peak humidity since the session started (reset on
++        # RESUMED, same as active_since_humidity), and the running "since"
++        # timestamps used to confirm a sustained decline / presence-clear
++        # before acting on either.
++        self._peak_humidity: Optional[float] = None
++        self._decline_since: Optional[datetime] = None
++        self._presence_clear_since: Optional[datetime] = None
++
+     # ------------------------------------------------------------------
+     # Public API
+     # ------------------------------------------------------------------
+@@ -134,6 +169,16 @@ class SessionDetector:
+         """
+         return self._active_since_humidity
+ 
++    @property
++    def peak_humidity(self) -> Optional[float]:
++        """
++        Highest humidity reading seen since the current session started (set
++        on STARTED, updated through ACTIVE, reset to the raw reading on
++        RESUMED), or ``None`` if IDLE. The reference point ADR-0005's decline
++        checks measure a drop from.
++        """
++        return self._peak_humidity
++
+     @property
+     def baseline_humidity(self) -> Optional[float]:
+         """
+@@ -143,7 +188,9 @@ class SessionDetector:
+         """
+         return self._baseline
+ 
+-    def update(self, humidity: float, now: datetime) -> Optional[StateChange]:
++    def update(
++        self, humidity: float, now: datetime, presence: Optional[bool] = None
++    ) -> Optional[StateChange]:
+         """
+         Process a new humidity reading.
+ 
+@@ -151,6 +198,12 @@ class SessionDetector:
+             humidity: Current relative humidity (%).
+             now:      Timestamp of the reading. Pass ``datetime.now()`` for live
+                       use or a fixed value for replay/testing.
++            presence: ``True``/``False`` if a presence sensor is configured
++                      and its current state is known, otherwise ``None``
++                      (no sensor configured, or state unknown/unavailable).
++                      Only consulted while in COOLDOWN (ADR-0005) — a
++                      confirmed decline plus continuously-clear presence can
++                      end a session faster than the cooldown timer alone.
+ 
+         Returns:
+             A ``StateChange`` if the session state changed, otherwise ``None``.
+@@ -169,7 +222,7 @@ class SessionDetector:
+ 
+         if self._state is SessionState.COOLDOWN:
+             above = humidity >= self._session_start_threshold
+-            return self._from_cooldown(above, humidity, now)
++            return self._from_cooldown(above, humidity, now, presence)
+ 
+         return None  # unreachable
+ 
+@@ -212,39 +265,91 @@ class SessionDetector:
+             # rise from true ambient conditions is visible downstream.
+             self._active_since_humidity = self._baseline
+             self._session_start_threshold = self._baseline + self.humidity_start_delta
++            # ADR-0005: seed the peak at the triggering reading; it only
++            # rises from here while ACTIVE.
++            self._peak_humidity = humidity
++            self._decline_since = None
++            self._presence_clear_since = None
+             return self._transition(SessionEvent.STARTED, SessionState.ACTIVE, humidity, now)
+         return None
+ 
+     def _from_active(
+         self, above: bool, humidity: float, now: datetime
+     ) -> Optional[StateChange]:
++        if self._peak_humidity is None or humidity > self._peak_humidity:
++            self._peak_humidity = humidity
+         if not above:
+             # Enter cooldown; record when it started.
+             self._cooldown_start = now
+             self._state = SessionState.COOLDOWN
++            self._decline_since = None
++            self._presence_clear_since = None
+             _LOGGER.debug(
+                 "Cooldown started at %s (humidity=%.1f%%)", now.isoformat(), humidity
+             )
+         return None  # no event on cooldown entry — session not yet confirmed ended
+ 
+     def _from_cooldown(
+-        self, above: bool, humidity: float, now: datetime
++        self, above: bool, humidity: float, now: datetime, presence: Optional[bool]
+     ) -> Optional[StateChange]:
+         if above:
+             # Humidity recovered — session resumed. Reset the humidity
+-            # baseline so a sibling starting a fresh shower during the
+-            # cooldown window gets its own baseline rather than inheriting
+-            # the previous person's cumulative humidity rise.
++            # baseline (and ADR-0005's peak/decline/presence tracking) so a
++            # sibling starting a fresh shower during the cooldown window
++            # gets its own baseline rather than inheriting the previous
++            # person's cumulative humidity rise.
+             self._cooldown_start = None
+             self._active_since_humidity = humidity
++            self._peak_humidity = humidity
++            self._decline_since = None
++            self._presence_clear_since = None
+             return self._transition(SessionEvent.RESUMED, SessionState.ACTIVE, humidity, now)
+ 
+-        elapsed = (now - self._cooldown_start).total_seconds()
+-        if elapsed >= self.cooldown_seconds:
++        # --- ADR-0005: has humidity sustained a decline from the peak? ---
++        declined = (
++            self._peak_humidity is not None
++            and (self._peak_humidity - humidity) >= self.humidity_decline_delta
++        )
++        if declined:
++            if self._decline_since is None:
++                self._decline_since = now
++        else:
++            self._decline_since = None
++        decline_confirmed = (
++            self._decline_since is not None
++            and (now - self._decline_since).total_seconds() >= self.decline_confirm_seconds
++        )
++
++        # --- ADR-0005: has presence read continuously clear? ---
++        if presence is False:
++            if self._presence_clear_since is None:
++                self._presence_clear_since = now
++        else:
++            # presence is True, or None (no sensor / unknown) — don't accrue.
++            self._presence_clear_since = None
++        presence_confirmed_clear = (
++            presence is not None
++            and self._presence_clear_since is not None
++            and (now - self._presence_clear_since).total_seconds()
++            >= self.presence_clear_confirm_seconds
++        )
++
++        if declined and presence_confirmed_clear:
++            ended = True  # fastest path: decline corroborated by presence
++        elif decline_confirmed:
++            ended = True  # sustained decline alone, no presence needed
++        else:
++            elapsed = (now - self._cooldown_start).total_seconds()
++            ended = elapsed >= self.cooldown_seconds  # stable/timeout fallback
++
++        if ended:
+             self._cooldown_start = None
+             self._active_since = None
+             self._active_since_humidity = None
+             self._session_start_threshold = None
++            self._peak_humidity = None
++            self._decline_since = None
++            self._presence_clear_since = None
+             return self._transition(SessionEvent.ENDED, SessionState.IDLE, humidity, now)
+ 
+         return None
+diff --git a/tests/test_init.py b/tests/test_init.py
+index 9a6399f..afcde18 100644
+--- a/tests/test_init.py
++++ b/tests/test_init.py
+@@ -2,9 +2,10 @@
+ # purpose: Tests for the Sensor Layer -> Session Detection -> Decision Engine
+ #          -> DecisionLog wiring (v0.2/v0.3/v0.4), the actuator script wiring
+ #          (v1.0), the humidity-delta cutoff gated by presence confirmation
+-#          (v1.4, ADR-0003), and the duration fallback (independent of
+-#          presence, off unless explicitly configured).
+-# version: 1.4.0
++#          (v1.4, ADR-0003), the duration fallback (independent of presence,
++#          off unless explicitly configured), and decline/presence-confirmed
++#          session end (v1.6, ADR-0005).
++# version: 1.6.0
+ # ---
+ 
+ import asyncio
+@@ -615,6 +616,91 @@ def test_no_presence_listener_when_not_configured():
+     assert "remove_presence_listener" not in hass.data[DOMAIN]
+ 
+ 
++# ---------------------------------------------------------------------------
++# Session end confirmation (v1.6 — decline + presence, ADR-0005)
++# ---------------------------------------------------------------------------
++
++def test_presence_clear_ends_a_declining_session_without_a_new_humidity_reading():
++    """A presence-clear event alone — no new humidity reading — can end an
++    already-declining session, by re-running Session Detection against the
++    last known humidity. presence_clear_confirm_seconds=0 isolates this from
++    real-time timing flakiness in the test."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass,
++            {
++                DOMAIN: {
++                    "humidity_sensor": "sensor.bathroom_humidity",
++                    "presence_sensor": "binary_sensor.bathroom_presence",
++                    "presence_clear_confirm_seconds": 0,
++                }
++            },
++        )
++    )
++
++    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
++    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
++
++    # Settle the ambient baseline, then trigger a session with a fast rise.
++    for state in ("58.0", "58.0", "61.5"):
++        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
++        asyncio.run(humidity_callback(event))
++
++    detector = hass.data[DOMAIN]["detector"]
++    assert detector.state is SessionState.ACTIVE
++
++    # Humidity drops back toward ambient -> COOLDOWN, with a clear decline
++    # from peak (~3.5pts, above the default 1.0 humidity_decline_delta).
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="58.0")})
++    asyncio.run(humidity_callback(event))
++    assert detector.state is SessionState.COOLDOWN
++
++    # No new humidity reading arrives — only presence clearing. With
++    # presence_clear_confirm_seconds=0, that's enough to confirm immediately.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
++    asyncio.run(presence_callback(event))
++
++    assert detector.state is SessionState.IDLE
++
++
++def test_presence_true_does_not_end_a_declining_session_via_wiring():
++    """The same decline, with presence reporting True instead, does not end
++    the session through this path."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass,
++            {
++                DOMAIN: {
++                    "humidity_sensor": "sensor.bathroom_humidity",
++                    "presence_sensor": "binary_sensor.bathroom_presence",
++                    "presence_clear_confirm_seconds": 0,
++                }
++            },
++        )
++    )
++
++    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
++    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
++
++    for state in ("58.0", "58.0", "61.5", "58.0"):
++        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
++        asyncio.run(humidity_callback(event))
++
++    detector = hass.data[DOMAIN]["detector"]
++    assert detector.state is SessionState.COOLDOWN
++
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="on")})
++    asyncio.run(presence_callback(event))
++
++    assert detector.state is SessionState.COOLDOWN
++
++
+ # ---------------------------------------------------------------------------
+ # Actuator wiring (v1.0 — real HA script calls on a decision change)
+ # ---------------------------------------------------------------------------
+@@ -1182,6 +1268,8 @@ if __name__ == "__main__":
+         test_presence_flicker_off_within_window_still_cuts,
+         test_presence_callback_ignores_unknown_state,
+         test_no_presence_listener_when_not_configured,
++        test_presence_clear_ends_a_declining_session_without_a_new_humidity_reading,
++        test_presence_true_does_not_end_a_declining_session_via_wiring,
+         test_actuator_not_called_when_no_scripts_configured,
+         test_actuator_called_on_water_available_decision,
+         test_actuator_called_on_water_cut_decision,
+diff --git a/tests/test_session.py b/tests/test_session.py
+index eea9019..96277a7 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -40,11 +40,21 @@ def t(seconds: int = 0) -> datetime:
+     return T0 + timedelta(seconds=seconds)
+ 
+ 
+-def make_detector(start_delta: float = 3.0, cooldown: int = 300, tau: float = 600.0) -> SessionDetector:
++def make_detector(
++    start_delta: float = 3.0,
++    cooldown: int = 300,
++    tau: float = 600.0,
++    decline_delta: float = 1.0,
++    decline_confirm: float = 60.0,
++    presence_clear_confirm: float = 60.0,
++) -> SessionDetector:
+     return SessionDetector(
+         humidity_start_delta=start_delta,
+         cooldown_seconds=cooldown,
+         baseline_time_constant_seconds=tau,
++        humidity_decline_delta=decline_delta,
++        decline_confirm_seconds=decline_confirm,
++        presence_clear_confirm_seconds=presence_clear_confirm,
+     )
+ 
+ 
+@@ -205,6 +215,164 @@ def test_sibling_shower_gets_fresh_baseline_on_resume():
+     assert d.active_since_humidity == 62.0       # fresh baseline, not ~58
+ 
+ 
++# ---------------------------------------------------------------------------
++# Decline-confirmed session end (ADR-0005)
++#
++# All tests here settle the ambient baseline exactly at 58.0 (two identical
++# IDLE readings before the session starts) and trigger with a 3.5-point rise
++# (humidity_start_delta=3.0), so the session's peak (61.5, the raw trigger
++# reading) sits just ~0.5pt above the frozen session_start_threshold
++# (~61.03). That small, known gap is what makes 58.0 (ambient) unambiguously
++# "declined" (3.5pts below peak) and 60.8 unambiguously "not declined" (only
++# 0.7pt below peak) relative to humidity_decline_delta=1.0.
++# ---------------------------------------------------------------------------
++
++def _settle_and_start(d: SessionDetector, base_t: int = 0) -> None:
++    """Seed the ambient baseline at exactly 58.0, then trigger a session
++    with a fast 3.5-point rise to 61.5 (peak=61.5, threshold~=61.03)."""
++    d.update(humidity=58.0, now=t(base_t))
++    d.update(humidity=58.0, now=t(base_t + 100))  # baseline settles at 58.0 exactly
++    change = d.update(humidity=61.5, now=t(base_t + 105))  # STARTED
++    assert change is not None and change.event is SessionEvent.STARTED
++
++
++def test_peak_humidity_tracks_highest_reading_while_active():
++    """peak_humidity rises through ACTIVE and is not just the trigger
++    reading."""
++    d = make_detector(start_delta=3.0)
++    _settle_and_start(d)
++    d.update(humidity=90.0, now=t(300))  # still ACTIVE (above threshold), new peak
++    assert d.peak_humidity == 90.0
++
++
++def test_sustained_decline_ends_session_before_cooldown_elapses_no_presence():
++    """A decline held for decline_confirm_seconds ends the session earlier
++    than the full cooldown timer, even with no presence sensor at all."""
++    d = make_detector(start_delta=3.0, cooldown=300, decline_delta=1.0, decline_confirm=60)
++    _settle_and_start(d)  # peak=61.5, threshold~=61.03
++    d.update(humidity=58.0, now=t(200))  # below threshold -> COOLDOWN
++
++    # Decline (61.5 - 58.0 = 3.5 >= 1.0) first observed here; not confirmed yet.
++    result = d.update(humidity=58.0, now=t(210))
++    assert result is None
++    assert d.state is SessionState.COOLDOWN
++
++    # 60s of continuous decline >= decline_confirm_seconds (60) -> ENDED,
++    # well before cooldown_seconds (300) would have elapsed since t(200).
++    change = d.update(humidity=58.0, now=t(270))
++    assert change is not None
++    assert change.event is SessionEvent.ENDED
++    assert d.state is SessionState.IDLE
++
++
++def test_single_noisy_dip_does_not_end_session_without_presence():
++    """Without presence corroboration, a decline that doesn't hold for the
++    full decline_confirm_seconds window does not end the session — this is
++    the noise guard ADR-0005 requires for the no-presence path."""
++    d = make_detector(start_delta=3.0, cooldown=300, decline_delta=1.0, decline_confirm=60)
++    _settle_and_start(d)  # peak=61.5, threshold~=61.03
++    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN
++
++    result = d.update(humidity=58.0, now=t(210))  # decline observed, timer starts
++    assert result is None
++
++    # Recovers to 60.8 — still below the RESUME threshold (~61.03), so stays
++    # in COOLDOWN, but only 0.7pt off peak (< decline_delta) so the decline
++    # is no longer considered to hold; its confirmation timer resets.
++    result = d.update(humidity=60.8, now=t(220))
++    assert result is None
++    assert d.state is SessionState.COOLDOWN
++
++    # Even after what would have been the full decline_confirm_seconds from
++    # the *original* dip, the reset means it still hasn't ended.
++    result = d.update(humidity=60.8, now=t(270))
++    assert result is None
++    assert d.state is SessionState.COOLDOWN
++
++
++def test_decline_with_confirmed_presence_clear_ends_session_immediately():
++    """With a presence sensor reading continuously False for
++    presence_clear_confirm_seconds, a concurrent decline ends the session
++    — using a decline_confirm_seconds long enough that, absent presence,
++    it would NOT have fired yet, isolating the presence-gated fast path."""
++    d = make_detector(
++        start_delta=3.0,
++        cooldown=300,
++        decline_delta=1.0,
++        decline_confirm=600,  # deliberately long — presence path must win
++        presence_clear_confirm=60,
++    )
++    _settle_and_start(d)  # peak=61.5, threshold~=61.03
++    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN
++
++    result = d.update(humidity=58.0, now=t(210), presence=False)
++    assert result is None  # presence-clear just started accruing
++
++    change = d.update(humidity=58.0, now=t(270), presence=False)
++    assert change is not None
++    assert change.event is SessionEvent.ENDED
++    assert d.state is SessionState.IDLE
++
++
++def test_presence_true_does_not_end_session_even_with_decline():
++    """presence=True never contributes to the presence-clear confirmation,
++    regardless of how long or how large the decline is."""
++    d = make_detector(
++        start_delta=3.0,
++        cooldown=300,
++        decline_delta=1.0,
++        decline_confirm=600,
++        presence_clear_confirm=60,
++    )
++    _settle_and_start(d)
++    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN
++
++    result = d.update(humidity=58.0, now=t(280), presence=True)
++    assert result is None
++    assert d.state is SessionState.COOLDOWN
++
++
++def test_flat_humidity_still_ends_via_cooldown_timeout_fallback():
++    """Humidity that is flat (not declining enough) with no presence data
++    still ends via the original elapsed-cooldown fallback — unchanged
++    behavior for the 'stable' case."""
++    d = make_detector(start_delta=3.0, cooldown=300, decline_delta=5.0, decline_confirm=60)
++    _settle_and_start(d)  # peak=61.5
++    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN; decline only 3.5 < 5.0
++
++    result = d.update(humidity=58.0, now=t(200 + 299))
++    assert result is None
++    assert d.state is SessionState.COOLDOWN
++
++    change = d.update(humidity=58.0, now=t(200 + 300))
++    assert change is not None
++    assert change.event is SessionEvent.ENDED
++
++
++def test_resume_resets_peak_and_decline_and_presence_tracking():
++    """RESUMED resets peak_humidity to the raw resume reading, consistent
++    with the existing active_since_humidity reset for sibling showers."""
++    d = make_detector(start_delta=3.0, cooldown=300, decline_delta=1.0, decline_confirm=60)
++    _settle_and_start(d)  # peak=61.5
++    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN
++    d.update(humidity=58.0, now=t(210))  # decline timer starts accruing
++
++    change = d.update(humidity=70.0, now=t(220))  # RESUMED (sibling), above threshold
++    assert change.event is SessionEvent.RESUMED
++    assert d.peak_humidity == 70.0
++
++    # Dropping straight back below threshold measures decline against the
++    # fresh peak (70.0), not the stale 61.5 — confirms the reset actually
++    # took effect rather than just not having been exercised yet.
++    d.update(humidity=58.0, now=t(230))  # -> COOLDOWN again, off the fresh peak
++    assert d.state is SessionState.COOLDOWN
++    result = d.update(humidity=58.0, now=t(240))  # decline timer starts (fresh peak)
++    assert result is None
++    change = d.update(humidity=58.0, now=t(240 + 60))
++    assert change is not None
++    assert change.event is SessionEvent.ENDED
++
++
+ # ---------------------------------------------------------------------------
+ # active_since tracking
+ # ---------------------------------------------------------------------------
+@@ -277,6 +445,13 @@ if __name__ == "__main__":
+         test_cooldown_ends_session_after_elapsed,
+         test_cooldown_resumes_on_rise_above_frozen_threshold,
+         test_sibling_shower_gets_fresh_baseline_on_resume,
++        test_peak_humidity_tracks_highest_reading_while_active,
++        test_sustained_decline_ends_session_before_cooldown_elapses_no_presence,
++        test_single_noisy_dip_does_not_end_session_without_presence,
++        test_decline_with_confirmed_presence_clear_ends_session_immediately,
++        test_presence_true_does_not_end_session_even_with_decline,
++        test_flat_humidity_still_ends_via_cooldown_timeout_fallback,
++        test_resume_resets_peak_and_decline_and_presence_tracking,
+         test_active_since_none_when_idle,
+         test_active_since_set_on_start,
+         test_active_since_cleared_on_end,
+-- 
+2.43.0
+

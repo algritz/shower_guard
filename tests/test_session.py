@@ -40,11 +40,21 @@ def t(seconds: int = 0) -> datetime:
     return T0 + timedelta(seconds=seconds)
 
 
-def make_detector(start_delta: float = 3.0, cooldown: int = 300, tau: float = 600.0) -> SessionDetector:
+def make_detector(
+    start_delta: float = 3.0,
+    cooldown: int = 300,
+    tau: float = 600.0,
+    decline_delta: float = 1.0,
+    decline_confirm: float = 60.0,
+    presence_clear_confirm: float = 60.0,
+) -> SessionDetector:
     return SessionDetector(
         humidity_start_delta=start_delta,
         cooldown_seconds=cooldown,
         baseline_time_constant_seconds=tau,
+        humidity_decline_delta=decline_delta,
+        decline_confirm_seconds=decline_confirm,
+        presence_clear_confirm_seconds=presence_clear_confirm,
     )
 
 
@@ -206,6 +216,164 @@ def test_sibling_shower_gets_fresh_baseline_on_resume():
 
 
 # ---------------------------------------------------------------------------
+# Decline-confirmed session end (ADR-0005)
+#
+# All tests here settle the ambient baseline exactly at 58.0 (two identical
+# IDLE readings before the session starts) and trigger with a 3.5-point rise
+# (humidity_start_delta=3.0), so the session's peak (61.5, the raw trigger
+# reading) sits just ~0.5pt above the frozen session_start_threshold
+# (~61.03). That small, known gap is what makes 58.0 (ambient) unambiguously
+# "declined" (3.5pts below peak) and 60.8 unambiguously "not declined" (only
+# 0.7pt below peak) relative to humidity_decline_delta=1.0.
+# ---------------------------------------------------------------------------
+
+def _settle_and_start(d: SessionDetector, base_t: int = 0) -> None:
+    """Seed the ambient baseline at exactly 58.0, then trigger a session
+    with a fast 3.5-point rise to 61.5 (peak=61.5, threshold~=61.03)."""
+    d.update(humidity=58.0, now=t(base_t))
+    d.update(humidity=58.0, now=t(base_t + 100))  # baseline settles at 58.0 exactly
+    change = d.update(humidity=61.5, now=t(base_t + 105))  # STARTED
+    assert change is not None and change.event is SessionEvent.STARTED
+
+
+def test_peak_humidity_tracks_highest_reading_while_active():
+    """peak_humidity rises through ACTIVE and is not just the trigger
+    reading."""
+    d = make_detector(start_delta=3.0)
+    _settle_and_start(d)
+    d.update(humidity=90.0, now=t(300))  # still ACTIVE (above threshold), new peak
+    assert d.peak_humidity == 90.0
+
+
+def test_sustained_decline_ends_session_before_cooldown_elapses_no_presence():
+    """A decline held for decline_confirm_seconds ends the session earlier
+    than the full cooldown timer, even with no presence sensor at all."""
+    d = make_detector(start_delta=3.0, cooldown=300, decline_delta=1.0, decline_confirm=60)
+    _settle_and_start(d)  # peak=61.5, threshold~=61.03
+    d.update(humidity=58.0, now=t(200))  # below threshold -> COOLDOWN
+
+    # Decline (61.5 - 58.0 = 3.5 >= 1.0) first observed here; not confirmed yet.
+    result = d.update(humidity=58.0, now=t(210))
+    assert result is None
+    assert d.state is SessionState.COOLDOWN
+
+    # 60s of continuous decline >= decline_confirm_seconds (60) -> ENDED,
+    # well before cooldown_seconds (300) would have elapsed since t(200).
+    change = d.update(humidity=58.0, now=t(270))
+    assert change is not None
+    assert change.event is SessionEvent.ENDED
+    assert d.state is SessionState.IDLE
+
+
+def test_single_noisy_dip_does_not_end_session_without_presence():
+    """Without presence corroboration, a decline that doesn't hold for the
+    full decline_confirm_seconds window does not end the session — this is
+    the noise guard ADR-0005 requires for the no-presence path."""
+    d = make_detector(start_delta=3.0, cooldown=300, decline_delta=1.0, decline_confirm=60)
+    _settle_and_start(d)  # peak=61.5, threshold~=61.03
+    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN
+
+    result = d.update(humidity=58.0, now=t(210))  # decline observed, timer starts
+    assert result is None
+
+    # Recovers to 60.8 — still below the RESUME threshold (~61.03), so stays
+    # in COOLDOWN, but only 0.7pt off peak (< decline_delta) so the decline
+    # is no longer considered to hold; its confirmation timer resets.
+    result = d.update(humidity=60.8, now=t(220))
+    assert result is None
+    assert d.state is SessionState.COOLDOWN
+
+    # Even after what would have been the full decline_confirm_seconds from
+    # the *original* dip, the reset means it still hasn't ended.
+    result = d.update(humidity=60.8, now=t(270))
+    assert result is None
+    assert d.state is SessionState.COOLDOWN
+
+
+def test_decline_with_confirmed_presence_clear_ends_session_immediately():
+    """With a presence sensor reading continuously False for
+    presence_clear_confirm_seconds, a concurrent decline ends the session
+    — using a decline_confirm_seconds long enough that, absent presence,
+    it would NOT have fired yet, isolating the presence-gated fast path."""
+    d = make_detector(
+        start_delta=3.0,
+        cooldown=300,
+        decline_delta=1.0,
+        decline_confirm=600,  # deliberately long — presence path must win
+        presence_clear_confirm=60,
+    )
+    _settle_and_start(d)  # peak=61.5, threshold~=61.03
+    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN
+
+    result = d.update(humidity=58.0, now=t(210), presence=False)
+    assert result is None  # presence-clear just started accruing
+
+    change = d.update(humidity=58.0, now=t(270), presence=False)
+    assert change is not None
+    assert change.event is SessionEvent.ENDED
+    assert d.state is SessionState.IDLE
+
+
+def test_presence_true_does_not_end_session_even_with_decline():
+    """presence=True never contributes to the presence-clear confirmation,
+    regardless of how long or how large the decline is."""
+    d = make_detector(
+        start_delta=3.0,
+        cooldown=300,
+        decline_delta=1.0,
+        decline_confirm=600,
+        presence_clear_confirm=60,
+    )
+    _settle_and_start(d)
+    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN
+
+    result = d.update(humidity=58.0, now=t(280), presence=True)
+    assert result is None
+    assert d.state is SessionState.COOLDOWN
+
+
+def test_flat_humidity_still_ends_via_cooldown_timeout_fallback():
+    """Humidity that is flat (not declining enough) with no presence data
+    still ends via the original elapsed-cooldown fallback — unchanged
+    behavior for the 'stable' case."""
+    d = make_detector(start_delta=3.0, cooldown=300, decline_delta=5.0, decline_confirm=60)
+    _settle_and_start(d)  # peak=61.5
+    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN; decline only 3.5 < 5.0
+
+    result = d.update(humidity=58.0, now=t(200 + 299))
+    assert result is None
+    assert d.state is SessionState.COOLDOWN
+
+    change = d.update(humidity=58.0, now=t(200 + 300))
+    assert change is not None
+    assert change.event is SessionEvent.ENDED
+
+
+def test_resume_resets_peak_and_decline_and_presence_tracking():
+    """RESUMED resets peak_humidity to the raw resume reading, consistent
+    with the existing active_since_humidity reset for sibling showers."""
+    d = make_detector(start_delta=3.0, cooldown=300, decline_delta=1.0, decline_confirm=60)
+    _settle_and_start(d)  # peak=61.5
+    d.update(humidity=58.0, now=t(200))  # -> COOLDOWN
+    d.update(humidity=58.0, now=t(210))  # decline timer starts accruing
+
+    change = d.update(humidity=70.0, now=t(220))  # RESUMED (sibling), above threshold
+    assert change.event is SessionEvent.RESUMED
+    assert d.peak_humidity == 70.0
+
+    # Dropping straight back below threshold measures decline against the
+    # fresh peak (70.0), not the stale 61.5 — confirms the reset actually
+    # took effect rather than just not having been exercised yet.
+    d.update(humidity=58.0, now=t(230))  # -> COOLDOWN again, off the fresh peak
+    assert d.state is SessionState.COOLDOWN
+    result = d.update(humidity=58.0, now=t(240))  # decline timer starts (fresh peak)
+    assert result is None
+    change = d.update(humidity=58.0, now=t(240 + 60))
+    assert change is not None
+    assert change.event is SessionEvent.ENDED
+
+
+# ---------------------------------------------------------------------------
 # active_since tracking
 # ---------------------------------------------------------------------------
 
@@ -277,6 +445,13 @@ if __name__ == "__main__":
         test_cooldown_ends_session_after_elapsed,
         test_cooldown_resumes_on_rise_above_frozen_threshold,
         test_sibling_shower_gets_fresh_baseline_on_resume,
+        test_peak_humidity_tracks_highest_reading_while_active,
+        test_sustained_decline_ends_session_before_cooldown_elapses_no_presence,
+        test_single_noisy_dip_does_not_end_session_without_presence,
+        test_decline_with_confirmed_presence_clear_ends_session_immediately,
+        test_presence_true_does_not_end_session_even_with_decline,
+        test_flat_humidity_still_ends_via_cooldown_timeout_fallback,
+        test_resume_resets_peak_and_decline_and_presence_tracking,
         test_active_since_none_when_idle,
         test_active_since_set_on_start,
         test_active_since_cleared_on_end,

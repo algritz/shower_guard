@@ -34,6 +34,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 | v1.3    | Live Baseline Humidity Entity | ✅ Done |
 | v1.4    | Presence Confirmation Gate (ADR-0003) | ✅ Done |
 | v1.5    | Dynamic Baseline Session Start (ADR-0004) | ✅ Done |
+| v1.6    | Decline-Confirmed Session End (ADR-0005) | ✅ Done |
 
 ## Installation
 
@@ -41,7 +42,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 2. Restart Home Assistant.
 3. Configure via `configuration.yaml` (see below).
 
-## Configuration (v1.5)
+## Configuration (v1.6)
 
 ```yaml
 shower_guard:
@@ -49,7 +50,10 @@ shower_guard:
   presence_sensor: binary_sensor.bathroom_presence    # optional — 'on'/'off' presence entity
   humidity_start_delta: 3.0                           # optional — default 3.0 (points above ambient baseline that trigger a session)
   baseline_time_constant_seconds: 600                 # optional — default 600 (10 min EMA time constant for the ambient baseline)
-  cooldown_seconds: 300                               # optional — default 300 (5 min)
+  cooldown_seconds: 300                               # optional — default 300 (5 min; stable/flat-humidity fallback, see ADR-0005)
+  humidity_decline_delta: 1.0                          # optional — default 1.0 (points below session peak that count as "declining", ADR-0005)
+  decline_confirm_seconds: 60                          # optional — default 60s (sustained decline required with no presence data, ADR-0005)
+  presence_clear_confirm_seconds: 60                   # optional — default 60s (sustained presence-clear that fast-ends a declining session, ADR-0005)
   max_humidity_delta: 15.0                             # optional — default 15.0 (percentage points RH)
   presence_confirmation_window_seconds: 60             # optional — default 60s (see ADR-0003)
   max_session_seconds: 900                             # optional — off by default; independent of presence_sensor
@@ -119,6 +123,25 @@ full rationale). If `presence_sensor` is not configured, or its state is
 `unknown`/`unavailable`, the delta policy never confirms — configure
 `max_session_seconds` as a fallback in that case.
 
+**Decline-confirmed session end (v1.6, ADR-0005):** once a session enters the
+post-threshold cooldown window, it now ends on whichever of these fires
+first, instead of purely waiting out `cooldown_seconds`:
+
+1. Humidity has fallen `humidity_decline_delta` points from the session's
+   peak **and** presence has read continuously `False` for
+   `presence_clear_confirm_seconds` — the fastest path, when a presence
+   sensor is configured.
+2. The same decline has held continuously for `decline_confirm_seconds`,
+   with no presence data required.
+3. `cooldown_seconds` has elapsed with neither of the above true — the
+   original "stable/flat humidity" fallback, unchanged.
+
+This fixes a case where a session's binary sensor stayed `on` for over two
+hours during a long, slow humidity decay: ADR-0004's lower, ambient-relative
+threshold made it easy for a shallow decay tail to keep re-crossing the
+threshold and resetting the cooldown timer. See ADR-0005 for the full
+rationale.
+
 **Decision Logging (v0.4):** every Decision Engine evaluation — not just
 changes — is recorded into a bounded, in-memory `DecisionLog`
 (`decision_log_size` entries, oldest dropped first). This gives a structured
@@ -140,6 +163,9 @@ python -m custom_components.shower_guard.replay readings.csv \
   --humidity-start-delta 3.0 \
   --baseline-time-constant-seconds 600 \
   --cooldown-seconds 300 \
+  --humidity-decline-delta 1.0 \
+  --decline-confirm-seconds 60 \
+  --presence-clear-confirm-seconds 60 \
   --max-humidity-delta 15.0 \
   --presence-confirmation-window-seconds 60 \
   --max-session-seconds 900
