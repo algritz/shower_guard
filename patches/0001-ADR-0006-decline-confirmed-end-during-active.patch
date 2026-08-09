@@ -1,0 +1,855 @@
+From 72594e7bfcd0e497a045bfbf3951142c4091c0f4 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.local>
+Date: Sat, 8 Aug 2026 19:27:41 +0000
+Subject: [PATCH] ADR-0006: presence-corroborated decline can end a session
+ from ACTIVE
+
+Fixes a real incident: a session peaked at 84.4% RH, declined steadily
+for over an hour, but plateaued at 54-59% -- still above the frozen
+session_start_threshold (~52-53%, baseline + humidity_start_delta=3.0).
+Because it never dropped back below that threshold, _from_active never
+transitioned to COOLDOWN, so none of ADR-0005's decline/presence checks
+(which live entirely in _from_cooldown) ever ran. The session's
+binary_sensor stayed 'on' for 8+ hours, for the rest of the logged day.
+
+Presence data showed the room was confirmed empty (continuously False)
+for 67 minutes starting 5 minutes after the peak -- strong, independent
+evidence the shower had ended, that the old logic had no way to use
+because it was still waiting to cross an absolute floor.
+
+Fix: track the decline-from-peak and presence-clear timers continuously
+from ACTIVE onward (previously COOLDOWN-only), via a new shared
+_update_decline_and_presence_tracking() helper. If a decline from peak
+is corroborated by presence continuously clear for
+presence_clear_confirm_seconds, the session now ends directly from
+ACTIVE -- skipping COOLDOWN entirely -- regardless of the absolute
+humidity level.
+
+Deliberately scoped to the presence-corroborated path only. The
+no-presence decline_confirmed path (ADR-0005) stays COOLDOWN-only,
+per ADR-0005's own "Alternatives Considered": without presence
+corroboration, a temporary dip mid-shower must not be able to end a
+session that's still genuinely running. Sessions without a configured
+presence sensor are not fixed by this ADR -- tracked in BACKLOG.md,
+alongside a proposed max_active_seconds hard backstop as a follow-up.
+
+- session.py: new _update_decline_and_presence_tracking() and
+  _end_session() helpers shared by _from_active/_from_cooldown.
+  _from_active gains a presence param and the early-exit check.
+  update()'s ACTIVE dispatch now passes presence through. No config
+  or wiring changes needed -- presence was already threaded into every
+  detector.update() call site from ADR-0005.
+- const.py / __init__.py / manifest.json: version bump only (1.7.0).
+- Tests: 5 new tests (4 in test_session.py incl. a regression test
+  replaying the incident's humidity/presence shape, 1 end-to-end wiring
+  test in test_init.py). Full suite: 110 passed (105 previously passing
+  + 5 new).
+- README.md / BACKLOG.md updated.
+
+See adr/ADR-0006-decline-confirmed-end-during-active.md for full
+rationale, including why the no-presence path is deliberately not
+extended the same way.
+---
+ BACKLOG.md                                    |  38 +++-
+ README.md                                     |  20 +-
+ ...006-decline-confirmed-end-during-active.md | 154 ++++++++++++++++
+ custom_components/shower_guard/__init__.py    |  13 +-
+ custom_components/shower_guard/const.py       |   4 +-
+ custom_components/shower_guard/manifest.json  |   2 +-
+ custom_components/shower_guard/session.py     | 171 ++++++++++++------
+ tests/test_init.py                            |  65 ++++++-
+ tests/test_session.py                         | 105 ++++++++++-
+ 9 files changed, 497 insertions(+), 75 deletions(-)
+ create mode 100644 adr/ADR-0006-decline-confirmed-end-during-active.md
+
+diff --git a/BACKLOG.md b/BACKLOG.md
+index b13970e..91bb26e 100644
+--- a/BACKLOG.md
++++ b/BACKLOG.md
+@@ -1,8 +1,8 @@
+ # Shower Guard — Backlog
+ 
+-Features deferred beyond the current roadmap. All milestones through v1.6
+-(Decline-Confirmed Session End) are complete — remaining work lives here
+-until scheduled.
++Features deferred beyond the current roadmap. All milestones through v1.7
++(Presence-Corroborated End From ACTIVE) are complete — remaining work lives
++here until scheduled.
+ 
+ ---
+ 
+@@ -64,6 +64,38 @@ until scheduled.
+   orthogonal to the dynamic baseline (ADR-0004) and presence-confirmation
+   gate on the delta cutoff (ADR-0003), both of which stay as they are.
+ 
++### Stuck-ACTIVE Sessions Without a Presence Sensor
++- **Reason deferred:** ADR-0006 fixes the logged "session stuck ACTIVE all
++  day" incident, but only for deployments with a `presence_sensor`
++  configured — its fix is the presence-corroborated decline path. A
++  deployment with no presence sensor (or one reading `unknown`/
++  `unavailable`) whose residual post-shower humidity settles above the
++  frozen `session_start_threshold` and never drops back below it can still
++  get stuck `ACTIVE` indefinitely, exactly as in the original incident.
++- **Target version:** Unscheduled — revisit if this is reported for a
++  no-presence-sensor deployment, or proactively alongside the
++  `max_active_seconds` backstop below.
++- **Notes:** Deliberately not fixed by widening the no-presence
++  `decline_confirmed` path to also run from `ACTIVE` — see ADR-0006's
++  "Alternatives Considered" for why that's rejected as unsafe (would let
++  ordinary humidity noise end a session someone is still showering in).
++
++### `max_active_seconds` Hard Backstop
++- **Reason deferred:** A duration-based cap independent of humidity and
++  presence — e.g. force-end any session that's been `ACTIVE` or `COOLDOWN`
++  longer than some large ceiling (an hour? two?) — would cover the
++  no-presence-sensor gap above as a blunt but reliable backstop. Deferred
++  rather than folded into ADR-0006 because it's an orthogonal mechanism
++  (a true ceiling, not trend/presence detection) that deserves its own ADR
++  and its own default-value discussion rather than being tacked onto this
++  one.
++- **Target version:** Unscheduled — natural pairing with the item above if
++  a no-presence-sensor stuck session is ever reported.
++- **Notes:** Distinct from the existing `max_session_seconds` (Decision
++  Engine, water-cut fallback for no-presence deployments) — this would live
++  in Session Detection and affect `binary_sensor.shower_guard_session_active`
++  directly, not just the water decision.
++
+ ---
+ 
+ ## Format
+diff --git a/README.md b/README.md
+index 78f3b44..ad12a9f 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ | v1.4    | Presence Confirmation Gate (ADR-0003) | ✅ Done |
+ | v1.5    | Dynamic Baseline Session Start (ADR-0004) | ✅ Done |
+ | v1.6    | Decline-Confirmed Session End (ADR-0005) | ✅ Done |
++| v1.7    | Presence-Corroborated End From ACTIVE (ADR-0006) | ✅ Done |
+ 
+ ## Installation
+ 
+@@ -42,7 +43,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ 2. Restart Home Assistant.
+ 3. Configure via `configuration.yaml` (see below).
+ 
+-## Configuration (v1.6)
++## Configuration (v1.7)
+ 
+ ```yaml
+ shower_guard:
+@@ -142,6 +143,23 @@ threshold made it easy for a shallow decay tail to keep re-crossing the
+ threshold and resetting the cooldown timer. See ADR-0005 for the full
+ rationale.
+ 
++**Presence-corroborated end from ACTIVE (v1.7, ADR-0006):** path 1 above
++(decline + confirmed presence-clear) is now also checked continuously while
++a session is still `ACTIVE` — not only after it reaches the post-threshold
++cooldown window. This fixes a related case ADR-0005 didn't cover: if
++post-shower residual humidity settles above the frozen `session_start_
++threshold` (e.g. a tight `humidity_start_delta`, or a bathroom that
++naturally holds humidity for hours) and never drops back below it, the
++session never reaches `COOLDOWN` at all, so none of ADR-0005's end-of-
++session checks ever run — leaving the session `ACTIVE` indefinitely. With a
++presence sensor, this is now caught directly: a confirmed decline from peak
++plus continuously-clear presence ends the session immediately regardless of
++the absolute humidity level. **Without a presence sensor, this specific
++failure mode is not fixed** — path 2 (decline alone) remains deliberately
++restricted to `COOLDOWN`, since without presence corroboration a session
++still `ACTIVE` must not end just because humidity dipped momentarily. See
++ADR-0006 for the full rationale, including the incident that surfaced this.
++
+ **Decision Logging (v0.4):** every Decision Engine evaluation — not just
+ changes — is recorded into a bounded, in-memory `DecisionLog`
+ (`decision_log_size` entries, oldest dropped first). This gives a structured
+diff --git a/adr/ADR-0006-decline-confirmed-end-during-active.md b/adr/ADR-0006-decline-confirmed-end-during-active.md
+new file mode 100644
+index 0000000..53befa9
+--- /dev/null
++++ b/adr/ADR-0006-decline-confirmed-end-during-active.md
+@@ -0,0 +1,154 @@
++# ADR-0006 — Presence-Corroborated Decline Can End a Session Directly From ACTIVE
++
++| Field     | Value                    |
++|-----------|--------------------------|
++| Status    | Accepted                 |
++| Date      | 2026-08-08               |
++| Author    | Technical Lead           |
++
++---
++
++## Context
++
++ADR-0005 fixed a real incident where a session's binary sensor stayed `on`
++for over two hours because `COOLDOWN → ENDED` relied purely on an elapsed
++timer that kept getting reset by a shallow decay tail re-crossing the frozen
++`session_start_threshold`. That fix — decline-from-peak detection,
++optionally corroborated by presence — was deliberately scoped to `COOLDOWN`
++only. Its own "Alternatives Considered" section explicitly rejected
++extending the same checks to `ACTIVE`, reasoning that the reported problem
++was specifically about time spent stuck *in* `COOLDOWN`, and that a session
++should keep needing to cross the frozen threshold before any end-detection
++logic applies at all.
++
++Real-world history logging from the following day surfaced a related but
++distinct failure this reasoning didn't anticipate: **a session that never
++reaches `COOLDOWN` in the first place.**
++
++A shower started at 03:39, peaked at 84.4% RH, and declined steadily for
++over an hour afterward — the exact trend pattern ADR-0005 was built to
++recognize. But it declined only down to a **54–59% plateau**, and the
++frozen `session_start_threshold` for that session was **~52–53%**
++(`baseline + humidity_start_delta`, with the tight default
++`humidity_start_delta` of 3.0). Because the plateau never dropped back
++below that threshold — not once, for the remaining eight-plus hours of
++logged history — `_from_active` never transitioned to `COOLDOWN`, and every
++one of ADR-0005's decline/presence checks, which live entirely inside
++`_from_cooldown`, never ran. `binary_sensor.shower_guard_session_active`
++stayed `on` all day.
++
++Meanwhile, the presence sensor read continuously `False` from 03:54 to
++05:01 — a 67-minute clear stretch starting just five minutes after the
++humidity peak. Presence data conclusively showed the room was empty; only
++`session.py`'s reliance on first crossing an absolute floor kept that
++signal from being used.
++
++This is a narrower and stronger case than the one ADR-0005 rejected.
++ADR-0005's alternative considered applying *all* of its end-detection
++paths to `ACTIVE`, including sustained decline **without** presence
++corroboration — and rightly worried that would let ordinary humidity noise
++end a session someone is still actively showering in. This ADR extends
++**only** the presence-corroborated path (declined-from-peak **and**
++presence continuously clear for `presence_clear_confirm_seconds`) to run
++from `ACTIVE`, and leaves the no-presence decline path exactly where
++ADR-0005 put it. Presence being confirmed absent is independent,
++external evidence that no one is in the room — not a proxy for "humidity
++is doing something typical of showers ending" the way an unconfirmed
++decline is.
++
++## Decision
++
++`SessionDetector` now tracks the decline-from-peak and presence-clear
++timers (`_decline_since`, `_presence_clear_since`) continuously from the
++moment a session becomes `ACTIVE`, not only after it reaches `COOLDOWN`.
++The tracking logic itself is unchanged from ADR-0005 — it's extracted into
++a shared helper (`_update_decline_and_presence_tracking`) so `_from_active`
++and `_from_cooldown` run the identical computation.
++
++**In `_from_active`:** after peak-tracking, if `declined` (humidity has
++fallen `humidity_decline_delta` points from the session's peak) **and**
++`presence_confirmed_clear` (presence has read continuously `False` for
++`presence_clear_confirm_seconds`) are both true, the session ends
++immediately — transitioning straight from `ACTIVE` to `IDLE`, skipping
++`COOLDOWN` entirely, since presence corroboration already serves as the
++confirmation `COOLDOWN` normally exists to provide. This check runs before
++the existing absolute-threshold check, so whichever condition is met first
++determines the outcome.
++
++**In `_from_cooldown`:** unchanged in effect. The sustained-decline-without-
++presence path (`decline_confirmed`) still only fires here — i.e., only
++once humidity has already dropped below the frozen absolute threshold —
++preserving ADR-0005's safety margin against ending a session that's still
++genuinely running.
++
++No configuration keys, wiring (`__init__.py`), or `replay.py` changes were
++needed: presence was already threaded into every `detector.update()` call
++site from ADR-0005, for exactly this kind of extension.
++
++### What changes
++
++| File         | Change |
++|--------------|--------|
++| `session.py` | New `_update_decline_and_presence_tracking()` helper shared by `_from_active` and `_from_cooldown`. New `_end_session()` helper consolidating the ENDED cleanup + transition, callable from either state. `_from_active` gains a `presence` parameter and the presence-corroborated early-exit check. `update()`'s ACTIVE dispatch now passes `presence` through. Docstrings updated to describe the extended state machine. |
++| `const.py`, `__init__.py`, `manifest.json` | Version bump only (1.7.0) — no new config keys, no wiring changes. |
++| Tests | New tests in `test_session.py` covering: a session ending directly from `ACTIVE` on presence-corroborated decline; the same decline with presence `True`/unknown *not* ending it early; decline alone (no presence) *not* ending it from `ACTIVE` even when sustained past `decline_confirm_seconds`; and a regression test replaying the real incident's humidity/presence trace end-to-end. |
++
++## Consequences
++
++- A session whose post-shower residual humidity never drops back below the
++  frozen absolute threshold — previously stuck `ACTIVE` indefinitely — now
++  ends as soon as presence is confirmed clear and a decline from peak is
++  underway, regardless of the absolute humidity level. This directly fixes
++  the logged incident.
++- Deployments **without** a presence sensor gain nothing from this ADR.
++  `presence_confirmed_clear` can never be true when `presence` is always
++  `None`, so a session with no presence sensor and a residual-humidity
++  plateau above the frozen threshold can still get stuck `ACTIVE`
++  indefinitely. This is a known, deliberate limitation — see Backlog.
++- The two-path split (presence-corroborated from `ACTIVE`; decline-alone
++  restricted to `COOLDOWN`) means a reader now needs to hold both
++  `_from_active` and `_from_cooldown` in mind to answer "what ends a
++  session," rather than just `_from_cooldown`. The shared helper keeps the
++  actual decline/presence computation in one place to limit this cost.
++- `COOLDOWN` can now be skipped entirely for a session that ends via the
++  presence-corroborated path from `ACTIVE`. `RESUMED` therefore cannot fire
++  for such a session (there was no `COOLDOWN` to resume from) — this is
++  correct: presence confirmed the room empty, so there is nothing to
++  "resume" until a genuinely new `STARTED` crossing occurs.
++- A brief presence blip shortly after a real end-of-session event (e.g.
++  someone stepping back in to grab a towel while residual humidity is
++  still elevated) can now register as a second, short `STARTED`/`ENDED`
++  pair rather than being absorbed into one long session. Replaying the
++  logged incident shows exactly this: the original session ends at 03:59,
++  a second short session runs 04:00–04:08, and the detector correctly
++  settles into `IDLE` for the rest of the day. This is judged more
++  accurate than the alternative (one session silently spanning both
++  events), and is consistent with how any other presence-driven
++  `RESUMED` already behaves.
++
++## Alternatives Considered
++
++- **Also extend the no-presence `decline_confirmed` path to `ACTIVE`** —
++  Rejected, for the same reason ADR-0005 rejected it for `COOLDOWN`-adjacent
++  reasoning applied more broadly: without presence corroboration, a
++  temporary dip in humidity while someone is still actively showering
++  (adjusting water temperature, stepping momentarily out of the direct
++  spray) is indistinguishable from a real decline using humidity alone.
++  Presence is what makes trusting an early decline safe; without it, the
++  existing requirement to first cross the frozen threshold remains the
++  right guard.
++- **Lower `humidity_start_delta` reuse — stop freezing the absolute
++  threshold at session start; keep tracking the ambient baseline through
++  ACTIVE/COOLDOWN too, and use `baseline + start_delta` live** — Rejected
++  as a separate, larger change with its own risks (a rising ambient
++  baseline during a long, hot, well-attended shower could itself cause a
++  session to look "resumed" indefinitely as its own residual heat lifts the
++  baseline it's being measured against). Left as a possible future ADR if
++  the presence-corroborated fix here proves insufficient across more
++  logged sessions.
++- **Add a `max_active_seconds` hard cap, independent of humidity/presence,
++  as a backstop** — Deferred, not rejected. This ADR's fix resolves the
++  logged incident for deployments with a presence sensor (David's chalet).
++  A duration-based backstop would also help the no-presence case this ADR
++  explicitly doesn't cover, but is an orthogonal, simpler mechanism worth
++  its own ADR rather than folding in here. Tracked in `BACKLOG.md`.
+diff --git a/custom_components/shower_guard/__init__.py b/custom_components/shower_guard/__init__.py
+index fdce459..74d67f5 100644
+--- a/custom_components/shower_guard/__init__.py
++++ b/custom_components/shower_guard/__init__.py
+@@ -1,6 +1,6 @@
+ # ---
+ # purpose: Home Assistant integration entry point for Shower Guard.
+-# version: 1.6.0
++# version: 1.7.0
+ # note: Wires the Sensor Layer (humidity entity, optional presence entity)
+ #       into Session Detection and the Decision Engine, records every
+ #       decision into a bounded DecisionLog, and — when configured — calls
+@@ -13,10 +13,13 @@
+ #       presence was seen True so brief mmWave dropouts within the
+ #       confirmation window don't defeat a real cutoff. The optional
+ #       duration fallback (max_session_seconds) is independent of presence
+-#       and disabled unless explicitly configured. Presence is also now fed
+-#       into Session Detection itself (see ADR-0005), so a session already
+-#       declining can end as soon as presence clears rather than only on
+-#       the next humidity reading or the cooldown timer.
++#       and disabled unless explicitly configured. Presence is also fed into
++#       Session Detection itself (see ADR-0005, extended to the ACTIVE state
++#       by ADR-0006), so a session already declining can end as soon as
++#       presence clears — even before humidity has dropped below the frozen
++#       absolute threshold — rather than only on the next humidity reading
++#       or the cooldown timer. No wiring changes were needed for ADR-0006:
++#       presence was already threaded into every detector.update() call.
+ # ---
+ 
+ import logging
+diff --git a/custom_components/shower_guard/const.py b/custom_components/shower_guard/const.py
+index a25b587..052a9a1 100644
+--- a/custom_components/shower_guard/const.py
++++ b/custom_components/shower_guard/const.py
+@@ -1,11 +1,11 @@
+ # ---
+ # purpose: Central constants for the Shower Guard integration.
+-# version: 1.6.0
++# version: 1.7.0
+ # note: Add new constants here. Never scatter magic strings across modules.
+ # ---
+ 
+ DOMAIN = "shower_guard"
+-VERSION = "1.6.0"
++VERSION = "1.7.0"
+ 
+ # Session Detection (v1.5, ADR-0004)
+ # Session start is relative to a tracked ambient baseline, not a flat
+diff --git a/custom_components/shower_guard/manifest.json b/custom_components/shower_guard/manifest.json
+index 9f69c4e..0e5aa16 100644
+--- a/custom_components/shower_guard/manifest.json
++++ b/custom_components/shower_guard/manifest.json
+@@ -1,7 +1,7 @@
+ {
+ 	"domain": "shower_guard",
+ 	"name": "Shower Guard",
+-	"version": "1.6.0",
++	"version": "1.7.0",
+ 	"documentation": "https://github.com/algritz/shower_guard",
+ 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
+ 	"dependencies": [],
+diff --git a/custom_components/shower_guard/session.py b/custom_components/shower_guard/session.py
+index 4613b90..f9aab64 100644
+--- a/custom_components/shower_guard/session.py
++++ b/custom_components/shower_guard/session.py
+@@ -2,10 +2,11 @@
+ # purpose: Session Detection layer — determines when a shower session starts,
+ #          continues, resumes, or ends based on humidity readings, using a
+ #          dynamic ambient baseline instead of a flat absolute threshold, and
+-#          (as of ADR-0005) a decline-from-peak trend — optionally gated by
+-#          presence — instead of relying solely on an elapsed cooldown timer
+-#          to confirm the session actually ended.
+-# version: 1.3.0 (integrated into repo v1.6.0, ADR-0005)
++#          (as of ADR-0005, extended by ADR-0006) a decline-from-peak trend —
++#          optionally gated by presence — instead of relying solely on an
++#          elapsed cooldown timer or a frozen absolute floor to confirm the
++#          session actually ended.
++# version: 1.4.0 (integrated into repo v1.7.0, ADR-0006)
+ # note:    Pure Python. No Home Assistant imports. Safe to unit-test and
+ #          replay. ``presence`` is accepted as a plain Optional[bool] value
+ #          the wiring layer already tracks — this file never touches HA.
+@@ -84,6 +85,7 @@ class SessionDetector:
+     State machine:
+ 
+         IDLE ──[humidity - baseline >= start_delta]──► ACTIVE   (emit STARTED)
++        ACTIVE ──[declined from peak AND presence confirmed clear]──► IDLE   (emit ENDED)
+         ACTIVE ──[humidity < frozen session_start_threshold]──► COOLDOWN
+         COOLDOWN ──[humidity >= frozen session_start_threshold]──► ACTIVE  (emit RESUMED)
+         COOLDOWN ──[see below]──► IDLE                           (emit ENDED)
+@@ -93,18 +95,27 @@ class SessionDetector:
+     hysteresis behavior the old flat threshold provided for ACTIVE/COOLDOWN
+     transitions — only the *start* trigger is now baseline-relative.
+ 
+-    Session end (v1.3, ADR-0005) is no longer purely a fixed timer. While in
+-    COOLDOWN, ending fires on the first of:
+-
+-    1. Humidity has fallen ``humidity_decline_delta`` points from the
+-       session's peak, AND presence has read continuously ``False`` for at
+-       least ``presence_clear_confirm_seconds`` (fastest path — requires a
+-       presence sensor).
+-    2. The same decline has held continuously for at least
+-       ``decline_confirm_seconds``, with no presence data required.
+-    3. ``cooldown_seconds`` has elapsed since entering COOLDOWN (unchanged
+-       fallback — the "flat/stable humidity" case where no clear decline is
+-       detected).
++    Session end (v1.3, ADR-0005; extended to ACTIVE by v1.4, ADR-0006) is no
++    longer purely a fixed timer, nor gated solely on first crossing the
++    frozen absolute threshold. Ending fires on the first of:
++
++    1. **(ADR-0006, checked continuously from ACTIVE onward.)** Humidity has
++       fallen ``humidity_decline_delta`` points from the session's peak, AND
++       presence has read continuously ``False`` for at least
++       ``presence_clear_confirm_seconds``. This can end a session directly
++       from ACTIVE — without ever crossing the frozen absolute threshold —
++       because presence confirms the room is empty regardless of how much
++       residual humidity remains. Requires a presence sensor.
++    2. **(ADR-0005, COOLDOWN only.)** The same decline has held continuously
++       for at least ``decline_confirm_seconds``, with no presence data
++       required. Deliberately restricted to COOLDOWN (i.e. only after
++       humidity has already dropped below the frozen threshold) — without
++       presence corroboration, a session still ACTIVE and above threshold
++       must not be able to end just because humidity dipped briefly (e.g. a
++       momentary temperature adjustment mid-shower).
++    3. **(unchanged fallback.)** ``cooldown_seconds`` has elapsed since
++       entering COOLDOWN — the "flat/stable humidity" case where no clear
++       decline is detected.
+     """
+ 
+     def __init__(
+@@ -201,9 +212,11 @@ class SessionDetector:
+             presence: ``True``/``False`` if a presence sensor is configured
+                       and its current state is known, otherwise ``None``
+                       (no sensor configured, or state unknown/unavailable).
+-                      Only consulted while in COOLDOWN (ADR-0005) — a
+-                      confirmed decline plus continuously-clear presence can
+-                      end a session faster than the cooldown timer alone.
++                      Consulted from ACTIVE onward (ADR-0006 extended this
++                      from COOLDOWN-only) — a confirmed decline plus
++                      continuously-clear presence can end a session
++                      immediately, even before humidity has dropped below
++                      the frozen absolute threshold.
+ 
+         Returns:
+             A ``StateChange`` if the session state changed, otherwise ``None``.
+@@ -218,7 +231,7 @@ class SessionDetector:
+ 
+         if self._state is SessionState.ACTIVE:
+             above = humidity >= self._session_start_threshold
+-            return self._from_active(above, humidity, now)
++            return self._from_active(above, humidity, now, presence)
+ 
+         if self._state is SessionState.COOLDOWN:
+             above = humidity >= self._session_start_threshold
+@@ -273,11 +286,80 @@ class SessionDetector:
+             return self._transition(SessionEvent.STARTED, SessionState.ACTIVE, humidity, now)
+         return None
+ 
++    def _update_decline_and_presence_tracking(
++        self, humidity: float, now: datetime, presence: Optional[bool]
++    ) -> tuple[bool, bool]:
++        """
++        Shared by ACTIVE (ADR-0006) and COOLDOWN (ADR-0005): update the
++        continuous decline-from-peak and presence-clear timers against the
++        current reading, and return ``(declined, presence_confirmed_clear)``.
++
++        Tracking this identically in both states — rather than only once
++        COOLDOWN is entered — is what lets ADR-0006's presence-corroborated
++        path fire straight from ACTIVE: a session whose humidity never drops
++        below the frozen absolute threshold (and so never reaches COOLDOWN
++        under the old ADR-0005 logic) can still be recognized as declining.
++        """
++        declined = (
++            self._peak_humidity is not None
++            and (self._peak_humidity - humidity) >= self.humidity_decline_delta
++        )
++        if declined:
++            if self._decline_since is None:
++                self._decline_since = now
++        else:
++            self._decline_since = None
++
++        if presence is False:
++            if self._presence_clear_since is None:
++                self._presence_clear_since = now
++        else:
++            # presence is True, or None (no sensor / unknown) — don't accrue.
++            self._presence_clear_since = None
++        presence_confirmed_clear = (
++            presence is not None
++            and self._presence_clear_since is not None
++            and (now - self._presence_clear_since).total_seconds()
++            >= self.presence_clear_confirm_seconds
++        )
++
++        return declined, presence_confirmed_clear
++
++    def _end_session(self, humidity: float, now: datetime) -> StateChange:
++        """Clear all session-scoped state and emit ENDED, from whichever
++        state (ACTIVE or COOLDOWN) the end was confirmed in."""
++        self._cooldown_start = None
++        self._active_since = None
++        self._active_since_humidity = None
++        self._session_start_threshold = None
++        self._peak_humidity = None
++        self._decline_since = None
++        self._presence_clear_since = None
++        return self._transition(SessionEvent.ENDED, SessionState.IDLE, humidity, now)
++
+     def _from_active(
+-        self, above: bool, humidity: float, now: datetime
++        self, above: bool, humidity: float, now: datetime, presence: Optional[bool]
+     ) -> Optional[StateChange]:
+         if self._peak_humidity is None or humidity > self._peak_humidity:
+             self._peak_humidity = humidity
++
++        declined, presence_confirmed_clear = self._update_decline_and_presence_tracking(
++            humidity, now, presence
++        )
++
++        if declined and presence_confirmed_clear:
++            # ADR-0006: presence conclusively confirms the room is empty, so
++            # a corroborated decline ends the session immediately — even
++            # though humidity hasn't dropped below the frozen absolute
++            # session_start_threshold. Without this, a session can get stuck
++            # ACTIVE indefinitely whenever post-shower residual humidity
++            # settles above that threshold and never crosses it again (see
++            # ADR-0006 for the incident this fixes). Deliberately requires
++            # presence — decline alone is not trusted this early (see
++            # _from_cooldown's decline_confirmed path, which stays
++            # COOLDOWN-only for that reason).
++            return self._end_session(humidity, now)
++
+         if not above:
+             # Enter cooldown; record when it started.
+             self._cooldown_start = now
+@@ -294,10 +376,10 @@ class SessionDetector:
+     ) -> Optional[StateChange]:
+         if above:
+             # Humidity recovered — session resumed. Reset the humidity
+-            # baseline (and ADR-0005's peak/decline/presence tracking) so a
+-            # sibling starting a fresh shower during the cooldown window
+-            # gets its own baseline rather than inheriting the previous
+-            # person's cumulative humidity rise.
++            # baseline (and ADR-0005/ADR-0006's peak/decline/presence
++            # tracking) so a sibling starting a fresh shower during the
++            # cooldown window gets its own baseline rather than inheriting
++            # the previous person's cumulative humidity rise.
+             self._cooldown_start = None
+             self._active_since_humidity = humidity
+             self._peak_humidity = humidity
+@@ -305,52 +387,27 @@ class SessionDetector:
+             self._presence_clear_since = None
+             return self._transition(SessionEvent.RESUMED, SessionState.ACTIVE, humidity, now)
+ 
+-        # --- ADR-0005: has humidity sustained a decline from the peak? ---
+-        declined = (
+-            self._peak_humidity is not None
+-            and (self._peak_humidity - humidity) >= self.humidity_decline_delta
++        declined, presence_confirmed_clear = self._update_decline_and_presence_tracking(
++            humidity, now, presence
+         )
+-        if declined:
+-            if self._decline_since is None:
+-                self._decline_since = now
+-        else:
+-            self._decline_since = None
+         decline_confirmed = (
+             self._decline_since is not None
+             and (now - self._decline_since).total_seconds() >= self.decline_confirm_seconds
+         )
+ 
+-        # --- ADR-0005: has presence read continuously clear? ---
+-        if presence is False:
+-            if self._presence_clear_since is None:
+-                self._presence_clear_since = now
+-        else:
+-            # presence is True, or None (no sensor / unknown) — don't accrue.
+-            self._presence_clear_since = None
+-        presence_confirmed_clear = (
+-            presence is not None
+-            and self._presence_clear_since is not None
+-            and (now - self._presence_clear_since).total_seconds()
+-            >= self.presence_clear_confirm_seconds
+-        )
+-
+         if declined and presence_confirmed_clear:
+             ended = True  # fastest path: decline corroborated by presence
+         elif decline_confirmed:
+-            ended = True  # sustained decline alone, no presence needed
++            ended = True  # sustained decline alone, no presence needed —
++            # safe here specifically because we're already below the frozen
++            # absolute threshold (see ADR-0006 for why this path is not
++            # also offered from ACTIVE).
+         else:
+             elapsed = (now - self._cooldown_start).total_seconds()
+             ended = elapsed >= self.cooldown_seconds  # stable/timeout fallback
+ 
+         if ended:
+-            self._cooldown_start = None
+-            self._active_since = None
+-            self._active_since_humidity = None
+-            self._session_start_threshold = None
+-            self._peak_humidity = None
+-            self._decline_since = None
+-            self._presence_clear_since = None
+-            return self._transition(SessionEvent.ENDED, SessionState.IDLE, humidity, now)
++            return self._end_session(humidity, now)
+ 
+         return None
+ 
+diff --git a/tests/test_init.py b/tests/test_init.py
+index afcde18..504ad32 100644
+--- a/tests/test_init.py
++++ b/tests/test_init.py
+@@ -3,9 +3,11 @@
+ #          -> DecisionLog wiring (v0.2/v0.3/v0.4), the actuator script wiring
+ #          (v1.0), the humidity-delta cutoff gated by presence confirmation
+ #          (v1.4, ADR-0003), the duration fallback (independent of presence,
+-#          off unless explicitly configured), and decline/presence-confirmed
+-#          session end (v1.6, ADR-0005).
+-# version: 1.6.0
++#          off unless explicitly configured), decline/presence-confirmed
++#          session end from COOLDOWN (v1.6, ADR-0005), and the same
++#          presence-corroborated end firing directly from ACTIVE (v1.7,
++#          ADR-0006).
++# version: 1.7.0
+ # ---
+ 
+ import asyncio
+@@ -701,6 +703,62 @@ def test_presence_true_does_not_end_a_declining_session_via_wiring():
+     assert detector.state is SessionState.COOLDOWN
+ 
+ 
++# ---------------------------------------------------------------------------
++# Presence-corroborated decline ends a session directly from ACTIVE
++# (v1.7, ADR-0006) — end-to-end via the real wiring, for a session whose
++# humidity never drops back below the frozen absolute threshold.
++# ---------------------------------------------------------------------------
++
++def test_presence_clear_ends_a_stuck_active_session_via_wiring():
++    """The real incident, reproduced through async_setup's actual wiring:
++    a session that rises high and declines to a plateau still above the
++    frozen threshold never reaches COOLDOWN, but a presence-clear event
++    (with presence_clear_confirm_seconds=0 to isolate from real-time
++    timing) ends it directly from ACTIVE instead of leaving it stuck."""
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass,
++            {
++                DOMAIN: {
++                    "humidity_sensor": "sensor.bathroom_humidity",
++                    "presence_sensor": "binary_sensor.bathroom_presence",
++                    "humidity_start_delta": 3.0,
++                    "presence_clear_confirm_seconds": 0,
++                }
++            },
++        )
++    )
++
++    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
++    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
++
++    # Settle the ambient baseline at 58.0, then trigger with a fast rise.
++    for state in ("58.0", "58.0", "61.5"):
++        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
++        asyncio.run(humidity_callback(event))
++
++    detector = hass.data[DOMAIN]["detector"]
++    assert detector.state is SessionState.ACTIVE
++
++    # Peaks, then declines only to 65.0 — well above the frozen threshold
++    # (~61.03), so this never crosses into COOLDOWN under the old logic.
++    for state in ("90.0", "65.0"):
++        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
++        asyncio.run(humidity_callback(event))
++    assert detector.state is SessionState.ACTIVE  # confirms the pre-fix stuck state
++
++    # Presence clears — with presence_clear_confirm_seconds=0, the decline
++    # (90.0 -> 65.0, already >= the default 1.0 humidity_decline_delta) is
++    # immediately corroborated, ending the session directly from ACTIVE.
++    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
++    asyncio.run(presence_callback(event))
++
++    assert detector.state is SessionState.IDLE
++
++
+ # ---------------------------------------------------------------------------
+ # Actuator wiring (v1.0 — real HA script calls on a decision change)
+ # ---------------------------------------------------------------------------
+@@ -1270,6 +1328,7 @@ if __name__ == "__main__":
+         test_no_presence_listener_when_not_configured,
+         test_presence_clear_ends_a_declining_session_without_a_new_humidity_reading,
+         test_presence_true_does_not_end_a_declining_session_via_wiring,
++        test_presence_clear_ends_a_stuck_active_session_via_wiring,
+         test_actuator_not_called_when_no_scripts_configured,
+         test_actuator_called_on_water_available_decision,
+         test_actuator_called_on_water_cut_decision,
+diff --git a/tests/test_session.py b/tests/test_session.py
+index 96277a7..408c75f 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -1,7 +1,11 @@
+ # ---
+-# purpose: Tests for the Session Detection layer (v1.2 — dynamic ambient
+-#          baseline replaces the flat absolute humidity threshold).
+-# version: 1.2.0
++# purpose: Tests for the Session Detection layer — dynamic ambient baseline
++#          replacing the flat absolute humidity threshold (v1.2, ADR-0004),
++#          decline/presence-confirmed session end from COOLDOWN (v1.3,
++#          ADR-0005), and the same presence-corroborated end firing
++#          directly from ACTIVE for sessions that never reach COOLDOWN
++#          (v1.4, ADR-0006).
++# version: 1.4.0
+ # ---
+ 
+ import sys
+@@ -373,6 +377,97 @@ def test_resume_resets_peak_and_decline_and_presence_tracking():
+     assert change.event is SessionEvent.ENDED
+ 
+ 
++# ---------------------------------------------------------------------------
++# Presence-corroborated decline can end a session directly from ACTIVE
++# (ADR-0006) — for a session whose humidity never drops back below the
++# frozen absolute session_start_threshold, so it never reaches COOLDOWN
++# under ADR-0005's logic alone.
++# ---------------------------------------------------------------------------
++
++def test_presence_corroborated_decline_ends_session_directly_from_active():
++    """A session that peaks, then declines to a plateau still well above the
++    frozen threshold (so it never enters COOLDOWN), ends directly from
++    ACTIVE once presence has read continuously False for
++    presence_clear_confirm_seconds alongside the decline."""
++    d = make_detector(start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60)
++    _settle_and_start(d)  # peak=61.5, threshold~=61.03
++    d.update(humidity=90.0, now=t(300))  # still ACTIVE, new peak=90.0
++
++    # Declines to 65.0 — still well above the frozen threshold (~61.03), so
++    # this never crosses into COOLDOWN under ADR-0005's logic alone.
++    result = d.update(humidity=65.0, now=t(310), presence=False)
++    assert result is None
++    assert d.state is SessionState.ACTIVE  # confirms it never reached COOLDOWN
++
++    # 60s of continuous presence-clear, decline still holding (25pts >= 1.0).
++    change = d.update(humidity=65.0, now=t(370), presence=False)
++    assert change is not None
++    assert change.event is SessionEvent.ENDED
++    assert d.state is SessionState.IDLE
++
++
++def test_presence_true_does_not_end_session_from_active_even_with_decline():
++    """presence=True never contributes to the ACTIVE-state fast path,
++    regardless of how large the decline is."""
++    d = make_detector(start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60)
++    _settle_and_start(d)
++    d.update(humidity=90.0, now=t(300))
++
++    d.update(humidity=65.0, now=t(310), presence=True)
++    result = d.update(humidity=65.0, now=t(370), presence=True)
++    assert result is None
++    assert d.state is SessionState.ACTIVE
++
++
++def test_decline_alone_does_not_end_session_from_active_without_presence():
++    """Without presence corroboration, a sustained decline that never drops
++    below the frozen threshold does NOT end the session from ACTIVE, even
++    well past decline_confirm_seconds — that path deliberately stays
++    COOLDOWN-only (see ADR-0006's 'Alternatives Considered')."""
++    d = make_detector(start_delta=3.0, decline_delta=1.0, decline_confirm=60)
++    _settle_and_start(d)
++    d.update(humidity=90.0, now=t(300))
++
++    result = d.update(humidity=65.0, now=t(310))  # no presence data at all
++    assert result is None
++    assert d.state is SessionState.ACTIVE
++
++    result = d.update(humidity=65.0, now=t(1000))  # long past decline_confirm_seconds
++    assert result is None
++    assert d.state is SessionState.ACTIVE  # known limitation without a presence sensor
++
++
++def test_regression_incident_stuck_active_session_now_ends():
++    """Regression test for the real incident ADR-0006 fixes: a shower peaks
++    high, declines to a plateau that never crosses back below the frozen
++    absolute threshold (baseline settled at 50.0, humidity_start_delta=3.0
++    -> threshold=53.0; the plateau here is 58-70%, matching the logged
++    54-59% plateau), but presence clears shortly after the peak. The
++    session must end via the ACTIVE-state presence-corroborated path
++    instead of staying ACTIVE for the rest of the day."""
++    d = make_detector(start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60)
++    d.update(humidity=50.0, now=t(0))
++    d.update(humidity=50.0, now=t(700))  # baseline settles at 50.0
++    change = d.update(humidity=54.6, now=t(705))  # STARTED, threshold=53.0
++    assert change is not None and change.event is SessionEvent.STARTED
++
++    d.update(humidity=84.4, now=t(900))  # peak, still ACTIVE
++
++    # Declines to 70.0 — still well above the 53.0 threshold, so this never
++    # crosses into COOLDOWN. Presence clears here too.
++    result = d.update(humidity=70.0, now=t(1200), presence=False)
++    assert result is None
++    assert d.state is SessionState.ACTIVE  # confirms the pre-fix stuck state
++
++    # 100s later: decline holds (84.4 -> 58.0 = 26.4pts) and presence has
++    # been clear for 100s (>= presence_clear_confirm_seconds=60) -> ends
++    # directly from ACTIVE, without ever reaching COOLDOWN.
++    change = d.update(humidity=58.0, now=t(1300), presence=False)
++    assert change is not None
++    assert change.event is SessionEvent.ENDED
++    assert d.state is SessionState.IDLE
++
++
+ # ---------------------------------------------------------------------------
+ # active_since tracking
+ # ---------------------------------------------------------------------------
+@@ -452,6 +547,10 @@ if __name__ == "__main__":
+         test_presence_true_does_not_end_session_even_with_decline,
+         test_flat_humidity_still_ends_via_cooldown_timeout_fallback,
+         test_resume_resets_peak_and_decline_and_presence_tracking,
++        test_presence_corroborated_decline_ends_session_directly_from_active,
++        test_presence_true_does_not_end_session_from_active_even_with_decline,
++        test_decline_alone_does_not_end_session_from_active_without_presence,
++        test_regression_incident_stuck_active_session_now_ends,
+         test_active_since_none_when_idle,
+         test_active_since_set_on_start,
+         test_active_since_cleared_on_end,
+-- 
+2.43.0
+

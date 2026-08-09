@@ -2,13 +2,15 @@
 # purpose: Decision Engine layer — decides whether water should remain
 #          available. Actuator-agnostic per ADR-0001. Also includes
 #          DecisionLog, a bounded audit trail of evaluations (v0.4).
-# version: 1.1.0
+# version: 1.2.0 (integrated into repo v1.8.0, ADR-0007)
 # note:    Pure Python. No Home Assistant imports. Consumes Session Detection
 #          output (current humidity, and optionally a presence reading)
 #          only — never raw sensor state objects. Safe to unit-test and
-#          replay. ``evaluate()`` is a pure computation — this layer never
-#          calls an actuator or HA script itself (see ADR-0001; only the
-#          wiring layer in __init__.py does that).
+#          replay. ``evaluate()`` computes from its inputs plus one small,
+#          deliberate piece of internal state (the ADR-0007 presence
+#          confirmation latch, keyed to the current delta baseline) — this
+#          layer never calls an actuator or HA script itself (see ADR-0001;
+#          only the wiring layer in __init__.py does that).
 # ---
 
 from __future__ import annotations
@@ -61,7 +63,7 @@ class DecisionEngine:
     """
     Decides whether water should remain available.
 
-    Policies (checked in order; see ADR-0003):
+    Policies (checked in order; see ADR-0003, extended by ADR-0007):
     1. No active session -> water available.
     2. Humidity has risen by ``max_humidity_delta`` or more above the current
        baseline (session-start reading, reset on every RESUMED event — see
@@ -79,6 +81,17 @@ class DecisionEngine:
        ``last_presence_at`` are always ``None``, so this policy can never
        cut — configure ``max_session_seconds`` (policy 3) as a fallback in
        that case.
+
+       **ADR-0007 latch:** once presence has been confirmed at least once
+       for the *current* delta baseline, that confirmation latches — a
+       later momentary presence-sensor gap (e.g. an mmWave dropout during
+       real, continuous occupancy) does not un-confirm it and cannot alone
+       flip the decision back to available while the delta is still
+       exceeded. The latch resets whenever the baseline itself resets (a
+       fresh ``STARTED``/``RESUMED``, i.e. ``active_since_humidity``
+       changes). It is not a substitute for genuine humidity decline: if
+       ``delta`` itself drops back under ``max_humidity_delta``, this
+       policy doesn't apply regardless of the latch.
     3. Optional duration fallback: if ``max_session_seconds`` is configured
        (not ``None``) and the session has run longer than it -> cut water.
        Disabled by default, and independent of presence — the safety net for
@@ -89,9 +102,10 @@ class DecisionEngine:
        doesn't return early.
     4. Otherwise -> water available.
 
-    ``evaluate()`` is a pure computation. Callers are responsible for logging
-    or acting on the result — this layer never calls an actuator or HA script
-    (see ADR-0001).
+    ``evaluate()`` computes from its inputs, plus the one small piece of
+    internal state described above (the presence confirmation latch) —
+    callers are otherwise responsible for logging or acting on the result.
+    This layer never calls an actuator or HA script itself (see ADR-0001).
     """
 
     def __init__(
@@ -103,6 +117,14 @@ class DecisionEngine:
         self.max_humidity_delta = max_humidity_delta
         self.max_session_seconds = max_session_seconds
         self.presence_confirmation_window_seconds = presence_confirmation_window_seconds
+
+        # ADR-0007: latches True the first time presence is confirmed for
+        # the current delta baseline, so a later momentary presence gap
+        # can't alone un-confirm it. Keyed to active_since_humidity, which
+        # resets on every fresh STARTED/RESUMED — the same reset points
+        # the delta baseline itself uses.
+        self._latched_baseline: Optional[float] = None
+        self._presence_confirmed_latch: bool = False
 
     def evaluate(
         self,
@@ -140,6 +162,10 @@ class DecisionEngine:
                                     confirmation window (see policy 2 above).
         """
         if session_state is SessionState.IDLE or active_since is None:
+            # No active session -- also resets the latch, so a brand new
+            # session always starts requiring a fresh presence confirmation.
+            self._latched_baseline = None
+            self._presence_confirmed_latch = False
             return DecisionResult(
                 decision=Decision.WATER_AVAILABLE,
                 reason="No active session.",
@@ -147,6 +173,14 @@ class DecisionEngine:
                 session_state=session_state,
                 session_duration_seconds=0.0,
             )
+
+        # ADR-0007: a fresh delta baseline (STARTED, or RESUMED for a
+        # sibling shower) means a fresh presence confirmation is required —
+        # the latch must not carry over from a previous, already-ended
+        # measurement window.
+        if active_since_humidity != self._latched_baseline:
+            self._latched_baseline = active_since_humidity
+            self._presence_confirmed_latch = False
 
         duration = (now - active_since).total_seconds()
 
@@ -157,29 +191,37 @@ class DecisionEngine:
         )
 
         if delta is not None and delta >= self.max_humidity_delta:
-            presence_confirmed = presence is True or (
+            presence_confirmed_now = presence is True or (
                 last_presence_at is not None
                 and (now - last_presence_at).total_seconds()
                 <= self.presence_confirmation_window_seconds
             )
-            if presence_confirmed:
+            if presence_confirmed_now:
+                self._presence_confirmed_latch = True
+
+            if self._presence_confirmed_latch:
                 return DecisionResult(
                     decision=Decision.WATER_CUT,
                     reason=(
                         f"Humidity rose {delta:.1f} points since session start "
                         f"(>= {self.max_humidity_delta:.1f}) with presence "
-                        f"confirmed within the last "
-                        f"{self.presence_confirmation_window_seconds:.0f}s."
+                        f"confirmed"
+                        + (
+                            " within the last "
+                            f"{self.presence_confirmation_window_seconds:.0f}s."
+                            if presence_confirmed_now
+                            else " earlier this session (latched, ADR-0007)."
+                        )
                     ),
                     timestamp=now,
                     session_state=session_state,
                     session_duration_seconds=duration,
                     humidity_delta=delta,
                 )
-            # Delta exceeded but not presence-confirmed: this policy alone
-            # won't cut, but doesn't return early either — the duration
-            # fallback below is an independent safety net and still gets a
-            # chance to catch the session.
+            # Delta exceeded but never presence-confirmed this baseline:
+            # this policy alone won't cut, but doesn't return early either —
+            # the duration fallback below is an independent safety net and
+            # still gets a chance to catch the session.
             delta_unconfirmed_reason = (
                 f"Humidity rose {delta:.1f} points (>= "
                 f"{self.max_humidity_delta:.1f}) but no presence confirmed "

@@ -1,8 +1,10 @@
 # ---
 # purpose: Tests for the Decision Engine layer — humidity delta gated by
-#          presence confirmation (v1.4, ADR-0003), optional duration
+#          presence confirmation (v1.4, ADR-0003), the confirmation latching
+#          per delta baseline so a later presence gap can't alone un-confirm
+#          an already-cut decision (v1.8, ADR-0007), optional duration
 #          fallback (independent of presence), and DecisionLog (v0.4).
-# version: 1.4.0
+# version: 1.8.0
 # ---
 
 import sys
@@ -230,6 +232,221 @@ def test_cooldown_state_delta_still_evaluated_with_presence():
         presence=True,
     )
     assert result.decision is Decision.WATER_CUT
+
+
+# ---------------------------------------------------------------------------
+# Presence confirmation latch (ADR-0007) — a later momentary presence gap
+# must not alone flip an already-confirmed cut back to available, while the
+# delta is still exceeded. Fixes real-world mmWave dropout flapping.
+# ---------------------------------------------------------------------------
+
+def test_latch_keeps_water_cut_through_a_later_presence_gap():
+    """Once presence has been confirmed for this baseline, a later gap
+    longer than presence_confirmation_window_seconds does not, by itself,
+    flip the decision back to available while delta is still exceeded —
+    this is the real mmWave dropout pattern (multiple >60s gaps during a
+    single continuous, attended shower)."""
+    engine = DecisionEngine(
+        max_humidity_delta=15.0, presence_confirmation_window_seconds=60.0
+    )
+
+    # Presence confirmed now -> cuts, and latches.
+    first = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(30),
+        humidity=90.0,
+        active_since_humidity=75.0,
+        presence=True,
+    )
+    assert first.decision is Decision.WATER_CUT
+
+    # Presence sensor now reads False, and the last confirmed sighting is
+    # well outside the 60s window — under the pre-ADR-0007 logic this would
+    # flip back to available. With the latch, it must not.
+    second = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(200),
+        humidity=91.0,
+        active_since_humidity=75.0,
+        presence=False,
+        last_presence_at=t(30),  # 170s ago — well outside the 60s window
+    )
+    assert second.decision is Decision.WATER_CUT
+    assert "latched" in second.reason.lower()
+
+
+def test_latch_does_not_apply_before_first_confirmation():
+    """The latch only helps once presence has actually been confirmed at
+    least once for this baseline — it doesn't pre-emptively assume
+    confirmation. Matches existing unconfirmed-delta behavior exactly."""
+    engine = DecisionEngine(
+        max_humidity_delta=15.0, presence_confirmation_window_seconds=60.0
+    )
+    result = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(200),
+        humidity=90.0,
+        active_since_humidity=75.0,
+        presence=False,
+        last_presence_at=t(100),  # outside window, and never confirmed before
+    )
+    assert result.decision is Decision.WATER_AVAILABLE
+
+
+def test_latch_resets_on_new_baseline_after_resumed():
+    """A fresh delta baseline (simulating a sibling's RESUMED shower, or any
+    new active_since_humidity) requires presence to be confirmed again —
+    the latch from the previous baseline does not carry over."""
+    engine = DecisionEngine(
+        max_humidity_delta=15.0, presence_confirmation_window_seconds=60.0
+    )
+
+    first = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(30),
+        humidity=90.0,
+        active_since_humidity=75.0,
+        presence=True,
+    )
+    assert first.decision is Decision.WATER_CUT
+
+    # New baseline (e.g. RESUMED reset active_since_humidity to 60.0) and
+    # presence is not currently/recently confirmed -> must not inherit the
+    # previous baseline's latch.
+    second = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(40),
+        humidity=80.0,
+        active_since_humidity=60.0,  # fresh baseline
+        presence=False,
+    )
+    assert second.decision is Decision.WATER_AVAILABLE
+
+
+def test_latch_does_not_override_genuine_delta_decline():
+    """The latch only matters while delta is still exceeded — once humidity
+    genuinely declines back under max_humidity_delta, water becomes
+    available regardless of the latch, and does not itself reset the latch
+    should delta rise again within the same baseline."""
+    engine = DecisionEngine(
+        max_humidity_delta=15.0, presence_confirmation_window_seconds=60.0
+    )
+
+    confirmed = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(30),
+        humidity=90.0,
+        active_since_humidity=75.0,
+        presence=True,
+    )
+    assert confirmed.decision is Decision.WATER_CUT
+
+    declined = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(200),
+        humidity=78.0,  # delta now 3.0, below the 15.0 threshold
+        active_since_humidity=75.0,
+        presence=False,
+    )
+    assert declined.decision is Decision.WATER_AVAILABLE
+
+    # Delta rises back above threshold within the *same* baseline, with no
+    # fresh presence confirmation -> the still-latched confirmation from
+    # earlier in this baseline still applies.
+    rises_again = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(210),
+        humidity=91.0,
+        active_since_humidity=75.0,
+        presence=False,
+    )
+    assert rises_again.decision is Decision.WATER_CUT
+
+
+def test_latch_resets_when_session_returns_to_idle():
+    """A session ending (IDLE) and a brand new one starting must require a
+    fresh presence confirmation — the latch cannot leak across sessions."""
+    engine = DecisionEngine(
+        max_humidity_delta=15.0, presence_confirmation_window_seconds=60.0
+    )
+
+    confirmed = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(30),
+        humidity=90.0,
+        active_since_humidity=75.0,
+        presence=True,
+    )
+    assert confirmed.decision is Decision.WATER_CUT
+
+    idle = engine.evaluate(SessionState.IDLE, active_since=None, now=t(500))
+    assert idle.decision is Decision.WATER_AVAILABLE
+
+    new_session_unconfirmed = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(600),
+        now=t(630),
+        humidity=90.0,
+        active_since_humidity=75.0,
+        presence=False,
+    )
+    assert new_session_unconfirmed.decision is Decision.WATER_AVAILABLE
+
+
+def test_regression_incident_no_longer_flaps_on_presence_gaps():
+    """Regression test for the real mmWave flicker pattern logged during an
+    actual continuous shower: presence toggles False/True every 20-100+
+    seconds, with several gaps exceeding the 60s confirmation window. Once
+    latched, the decision must not flap back to available on those gaps."""
+    engine = DecisionEngine(
+        max_humidity_delta=15.0, presence_confirmation_window_seconds=60.0
+    )
+
+    # Presence confirmed True at t(90) while delta is already well over
+    # threshold -> cuts and latches.
+    first = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(90),
+        humidity=93.0,
+        active_since_humidity=75.0,
+        presence=True,
+    )
+    assert first.decision is Decision.WATER_CUT
+
+    # A 104-second presence gap follows (matching the logged 03:42:22 ->
+    # 03:44:06 gap) — old logic would flip this to available.
+    gap = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(194),
+        humidity=95.0,
+        active_since_humidity=75.0,
+        presence=False,
+        last_presence_at=t(90),
+    )
+    assert gap.decision is Decision.WATER_CUT
+
+    # A second, later gap of similar length — still latched.
+    second_gap = engine.evaluate(
+        SessionState.ACTIVE,
+        active_since=t(0),
+        now=t(400),
+        humidity=96.0,
+        active_since_humidity=75.0,
+        presence=False,
+        last_presence_at=t(300),
+    )
+    assert second_gap.decision is Decision.WATER_CUT
 
 
 # ---------------------------------------------------------------------------

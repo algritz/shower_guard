@@ -35,6 +35,8 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 | v1.4    | Presence Confirmation Gate (ADR-0003) | ✅ Done |
 | v1.5    | Dynamic Baseline Session Start (ADR-0004) | ✅ Done |
 | v1.6    | Decline-Confirmed Session End (ADR-0005) | ✅ Done |
+| v1.7    | Presence-Corroborated End From ACTIVE (ADR-0006) | ✅ Done |
+| v1.8    | Presence Confirmation Latch (ADR-0007) | ✅ Done |
 
 ## Installation
 
@@ -42,7 +44,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 2. Restart Home Assistant.
 3. Configure via `configuration.yaml` (see below).
 
-## Configuration (v1.6)
+## Configuration (v1.8)
 
 ```yaml
 shower_guard:
@@ -141,6 +143,36 @@ hours during a long, slow humidity decay: ADR-0004's lower, ambient-relative
 threshold made it easy for a shallow decay tail to keep re-crossing the
 threshold and resetting the cooldown timer. See ADR-0005 for the full
 rationale.
+
+**Presence-corroborated end from ACTIVE (v1.7, ADR-0006):** path 1 above
+(decline + confirmed presence-clear) is now also checked continuously while
+a session is still `ACTIVE` — not only after it reaches the post-threshold
+cooldown window. This fixes a related case ADR-0005 didn't cover: if
+post-shower residual humidity settles above the frozen `session_start_
+threshold` (e.g. a tight `humidity_start_delta`, or a bathroom that
+naturally holds humidity for hours) and never drops back below it, the
+session never reaches `COOLDOWN` at all, so none of ADR-0005's end-of-
+session checks ever run — leaving the session `ACTIVE` indefinitely. With a
+presence sensor, this is now caught directly: a confirmed decline from peak
+plus continuously-clear presence ends the session immediately regardless of
+the absolute humidity level. **Without a presence sensor, this specific
+failure mode is not fixed** — path 2 (decline alone) remains deliberately
+restricted to `COOLDOWN`, since without presence corroboration a session
+still `ACTIVE` must not end just because humidity dipped momentarily. See
+ADR-0006 for the full rationale, including the incident that surfaced this.
+
+**Presence confirmation latch (v1.8, ADR-0007):** the humidity-delta cutoff's
+presence confirmation (ADR-0003) now latches per delta baseline instead of
+being re-checked fresh on every evaluation. Once presence has been confirmed
+at least once for the current baseline, a later momentary presence-sensor
+gap (e.g. an mmWave dropout during real, continuous occupancy) cannot alone
+flip an already-cut decision back to available while the delta remains
+exceeded. This fixes a logged case where a flaky presence sensor toggled the
+water cut on and off roughly six times in 13 minutes during one continuous,
+attended shower. The latch resets on a fresh baseline (a new `STARTED` or a
+sibling's `RESUMED`) or when the session ends, and never overrides a genuine
+humidity decline — it only matters while delta is still over threshold. See
+ADR-0007 for the full rationale.
 
 **Decision Logging (v0.4):** every Decision Engine evaluation — not just
 changes — is recorded into a bounded, in-memory `DecisionLog`

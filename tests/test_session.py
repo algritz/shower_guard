@@ -1,7 +1,11 @@
 # ---
-# purpose: Tests for the Session Detection layer (v1.2 — dynamic ambient
-#          baseline replaces the flat absolute humidity threshold).
-# version: 1.2.0
+# purpose: Tests for the Session Detection layer — dynamic ambient baseline
+#          replacing the flat absolute humidity threshold (v1.2, ADR-0004),
+#          decline/presence-confirmed session end from COOLDOWN (v1.3,
+#          ADR-0005), and the same presence-corroborated end firing
+#          directly from ACTIVE for sessions that never reach COOLDOWN
+#          (v1.4, ADR-0006).
+# version: 1.4.0
 # ---
 
 import sys
@@ -374,6 +378,97 @@ def test_resume_resets_peak_and_decline_and_presence_tracking():
 
 
 # ---------------------------------------------------------------------------
+# Presence-corroborated decline can end a session directly from ACTIVE
+# (ADR-0006) — for a session whose humidity never drops back below the
+# frozen absolute session_start_threshold, so it never reaches COOLDOWN
+# under ADR-0005's logic alone.
+# ---------------------------------------------------------------------------
+
+def test_presence_corroborated_decline_ends_session_directly_from_active():
+    """A session that peaks, then declines to a plateau still well above the
+    frozen threshold (so it never enters COOLDOWN), ends directly from
+    ACTIVE once presence has read continuously False for
+    presence_clear_confirm_seconds alongside the decline."""
+    d = make_detector(start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60)
+    _settle_and_start(d)  # peak=61.5, threshold~=61.03
+    d.update(humidity=90.0, now=t(300))  # still ACTIVE, new peak=90.0
+
+    # Declines to 65.0 — still well above the frozen threshold (~61.03), so
+    # this never crosses into COOLDOWN under ADR-0005's logic alone.
+    result = d.update(humidity=65.0, now=t(310), presence=False)
+    assert result is None
+    assert d.state is SessionState.ACTIVE  # confirms it never reached COOLDOWN
+
+    # 60s of continuous presence-clear, decline still holding (25pts >= 1.0).
+    change = d.update(humidity=65.0, now=t(370), presence=False)
+    assert change is not None
+    assert change.event is SessionEvent.ENDED
+    assert d.state is SessionState.IDLE
+
+
+def test_presence_true_does_not_end_session_from_active_even_with_decline():
+    """presence=True never contributes to the ACTIVE-state fast path,
+    regardless of how large the decline is."""
+    d = make_detector(start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60)
+    _settle_and_start(d)
+    d.update(humidity=90.0, now=t(300))
+
+    d.update(humidity=65.0, now=t(310), presence=True)
+    result = d.update(humidity=65.0, now=t(370), presence=True)
+    assert result is None
+    assert d.state is SessionState.ACTIVE
+
+
+def test_decline_alone_does_not_end_session_from_active_without_presence():
+    """Without presence corroboration, a sustained decline that never drops
+    below the frozen threshold does NOT end the session from ACTIVE, even
+    well past decline_confirm_seconds — that path deliberately stays
+    COOLDOWN-only (see ADR-0006's 'Alternatives Considered')."""
+    d = make_detector(start_delta=3.0, decline_delta=1.0, decline_confirm=60)
+    _settle_and_start(d)
+    d.update(humidity=90.0, now=t(300))
+
+    result = d.update(humidity=65.0, now=t(310))  # no presence data at all
+    assert result is None
+    assert d.state is SessionState.ACTIVE
+
+    result = d.update(humidity=65.0, now=t(1000))  # long past decline_confirm_seconds
+    assert result is None
+    assert d.state is SessionState.ACTIVE  # known limitation without a presence sensor
+
+
+def test_regression_incident_stuck_active_session_now_ends():
+    """Regression test for the real incident ADR-0006 fixes: a shower peaks
+    high, declines to a plateau that never crosses back below the frozen
+    absolute threshold (baseline settled at 50.0, humidity_start_delta=3.0
+    -> threshold=53.0; the plateau here is 58-70%, matching the logged
+    54-59% plateau), but presence clears shortly after the peak. The
+    session must end via the ACTIVE-state presence-corroborated path
+    instead of staying ACTIVE for the rest of the day."""
+    d = make_detector(start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60)
+    d.update(humidity=50.0, now=t(0))
+    d.update(humidity=50.0, now=t(700))  # baseline settles at 50.0
+    change = d.update(humidity=54.6, now=t(705))  # STARTED, threshold=53.0
+    assert change is not None and change.event is SessionEvent.STARTED
+
+    d.update(humidity=84.4, now=t(900))  # peak, still ACTIVE
+
+    # Declines to 70.0 — still well above the 53.0 threshold, so this never
+    # crosses into COOLDOWN. Presence clears here too.
+    result = d.update(humidity=70.0, now=t(1200), presence=False)
+    assert result is None
+    assert d.state is SessionState.ACTIVE  # confirms the pre-fix stuck state
+
+    # 100s later: decline holds (84.4 -> 58.0 = 26.4pts) and presence has
+    # been clear for 100s (>= presence_clear_confirm_seconds=60) -> ends
+    # directly from ACTIVE, without ever reaching COOLDOWN.
+    change = d.update(humidity=58.0, now=t(1300), presence=False)
+    assert change is not None
+    assert change.event is SessionEvent.ENDED
+    assert d.state is SessionState.IDLE
+
+
+# ---------------------------------------------------------------------------
 # active_since tracking
 # ---------------------------------------------------------------------------
 
@@ -452,6 +547,10 @@ if __name__ == "__main__":
         test_presence_true_does_not_end_session_even_with_decline,
         test_flat_humidity_still_ends_via_cooldown_timeout_fallback,
         test_resume_resets_peak_and_decline_and_presence_tracking,
+        test_presence_corroborated_decline_ends_session_directly_from_active,
+        test_presence_true_does_not_end_session_from_active_even_with_decline,
+        test_decline_alone_does_not_end_session_from_active_without_presence,
+        test_regression_incident_stuck_active_session_now_ends,
         test_active_since_none_when_idle,
         test_active_since_set_on_start,
         test_active_since_cleared_on_end,

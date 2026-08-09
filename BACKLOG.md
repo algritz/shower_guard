@@ -1,7 +1,7 @@
 # Shower Guard — Backlog
 
-Features deferred beyond the current roadmap. All milestones through v1.6
-(Decline-Confirmed Session End) are complete — remaining work lives here
+Features deferred beyond the current roadmap. All milestones through v1.8
+(Presence Confirmation Latch) are complete — remaining work lives here
 until scheduled.
 
 ---
@@ -63,6 +63,38 @@ until scheduled.
 - **Notes:** Scoped to `session.py`'s `_from_cooldown` only if picked up —
   orthogonal to the dynamic baseline (ADR-0004) and presence-confirmation
   gate on the delta cutoff (ADR-0003), both of which stay as they are.
+
+### Stuck-ACTIVE Sessions Without a Presence Sensor
+- **Reason deferred:** ADR-0006 fixes the logged "session stuck ACTIVE all
+  day" incident, but only for deployments with a `presence_sensor`
+  configured — its fix is the presence-corroborated decline path. A
+  deployment with no presence sensor (or one reading `unknown`/
+  `unavailable`) whose residual post-shower humidity settles above the
+  frozen `session_start_threshold` and never drops back below it can still
+  get stuck `ACTIVE` indefinitely, exactly as in the original incident.
+- **Target version:** Unscheduled — revisit if this is reported for a
+  no-presence-sensor deployment, or proactively alongside the
+  `max_active_seconds` backstop below.
+- **Notes:** Deliberately not fixed by widening the no-presence
+  `decline_confirmed` path to also run from `ACTIVE` — see ADR-0006's
+  "Alternatives Considered" for why that's rejected as unsafe (would let
+  ordinary humidity noise end a session someone is still showering in).
+
+### `max_active_seconds` Hard Backstop
+- **Reason deferred:** A duration-based cap independent of humidity and
+  presence — e.g. force-end any session that's been `ACTIVE` or `COOLDOWN`
+  longer than some large ceiling (an hour? two?) — would cover the
+  no-presence-sensor gap above as a blunt but reliable backstop. Deferred
+  rather than folded into ADR-0006 because it's an orthogonal mechanism
+  (a true ceiling, not trend/presence detection) that deserves its own ADR
+  and its own default-value discussion rather than being tacked onto this
+  one.
+- **Target version:** Unscheduled — natural pairing with the item above if
+  a no-presence-sensor stuck session is ever reported.
+- **Notes:** Distinct from the existing `max_session_seconds` (Decision
+  Engine, water-cut fallback for no-presence deployments) — this would live
+  in Session Detection and affect `binary_sensor.shower_guard_session_active`
+  directly, not just the water decision.
 
 ---
 

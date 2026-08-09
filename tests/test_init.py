@@ -3,9 +3,11 @@
 #          -> DecisionLog wiring (v0.2/v0.3/v0.4), the actuator script wiring
 #          (v1.0), the humidity-delta cutoff gated by presence confirmation
 #          (v1.4, ADR-0003), the duration fallback (independent of presence,
-#          off unless explicitly configured), and decline/presence-confirmed
-#          session end (v1.6, ADR-0005).
-# version: 1.6.0
+#          off unless explicitly configured), decline/presence-confirmed
+#          session end from COOLDOWN (v1.6, ADR-0005), and the same
+#          presence-corroborated end firing directly from ACTIVE (v1.7,
+#          ADR-0006).
+# version: 1.7.0
 # ---
 
 import asyncio
@@ -702,6 +704,62 @@ def test_presence_true_does_not_end_a_declining_session_via_wiring():
 
 
 # ---------------------------------------------------------------------------
+# Presence-corroborated decline ends a session directly from ACTIVE
+# (v1.7, ADR-0006) — end-to-end via the real wiring, for a session whose
+# humidity never drops back below the frozen absolute threshold.
+# ---------------------------------------------------------------------------
+
+def test_presence_clear_ends_a_stuck_active_session_via_wiring():
+    """The real incident, reproduced through async_setup's actual wiring:
+    a session that rises high and declines to a plateau still above the
+    frozen threshold never reaches COOLDOWN, but a presence-clear event
+    (with presence_clear_confirm_seconds=0 to isolate from real-time
+    timing) ends it directly from ACTIVE instead of leaving it stuck."""
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass,
+            {
+                DOMAIN: {
+                    "humidity_sensor": "sensor.bathroom_humidity",
+                    "presence_sensor": "binary_sensor.bathroom_presence",
+                    "humidity_start_delta": 3.0,
+                    "presence_clear_confirm_seconds": 0,
+                }
+            },
+        )
+    )
+
+    humidity_callback = callback_for(captured, "sensor.bathroom_humidity")
+    presence_callback = callback_for(captured, "binary_sensor.bathroom_presence")
+
+    # Settle the ambient baseline at 58.0, then trigger with a fast rise.
+    for state in ("58.0", "58.0", "61.5"):
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+        asyncio.run(humidity_callback(event))
+
+    detector = hass.data[DOMAIN]["detector"]
+    assert detector.state is SessionState.ACTIVE
+
+    # Peaks, then declines only to 65.0 — well above the frozen threshold
+    # (~61.03), so this never crosses into COOLDOWN under the old logic.
+    for state in ("90.0", "65.0"):
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state=state)})
+        asyncio.run(humidity_callback(event))
+    assert detector.state is SessionState.ACTIVE  # confirms the pre-fix stuck state
+
+    # Presence clears — with presence_clear_confirm_seconds=0, the decline
+    # (90.0 -> 65.0, already >= the default 1.0 humidity_decline_delta) is
+    # immediately corroborated, ending the session directly from ACTIVE.
+    event = SimpleNamespace(data={"new_state": SimpleNamespace(state="off")})
+    asyncio.run(presence_callback(event))
+
+    assert detector.state is SessionState.IDLE
+
+
+# ---------------------------------------------------------------------------
 # Actuator wiring (v1.0 — real HA script calls on a decision change)
 # ---------------------------------------------------------------------------
 
@@ -1270,6 +1328,7 @@ if __name__ == "__main__":
         test_no_presence_listener_when_not_configured,
         test_presence_clear_ends_a_declining_session_without_a_new_humidity_reading,
         test_presence_true_does_not_end_a_declining_session_via_wiring,
+        test_presence_clear_ends_a_stuck_active_session_via_wiring,
         test_actuator_not_called_when_no_scripts_configured,
         test_actuator_called_on_water_available_decision,
         test_actuator_called_on_water_cut_decision,

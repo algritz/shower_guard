@@ -1,6 +1,6 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 1.6.0
+# version: 1.8.0
 # note: Wires the Sensor Layer (humidity entity, optional presence entity)
 #       into Session Detection and the Decision Engine, records every
 #       decision into a bounded DecisionLog, and — when configured — calls
@@ -13,10 +13,13 @@
 #       presence was seen True so brief mmWave dropouts within the
 #       confirmation window don't defeat a real cutoff. The optional
 #       duration fallback (max_session_seconds) is independent of presence
-#       and disabled unless explicitly configured. Presence is also now fed
-#       into Session Detection itself (see ADR-0005), so a session already
-#       declining can end as soon as presence clears rather than only on
-#       the next humidity reading or the cooldown timer.
+#       and disabled unless explicitly configured. Presence is also fed into
+#       Session Detection itself (see ADR-0005, extended to the ACTIVE state
+#       by ADR-0006), so a session already declining can end as soon as
+#       presence clears — even before humidity has dropped below the frozen
+#       absolute threshold — rather than only on the next humidity reading
+#       or the cooldown timer. No wiring changes were needed for ADR-0006:
+#       presence was already threaded into every detector.update() call.
 # ---
 
 import logging
