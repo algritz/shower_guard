@@ -1,12 +1,12 @@
 # ---
 # purpose: Session Detection layer — determines when a shower session starts,
 #          continues, resumes, or ends based on humidity readings, using a
-#          dynamic ambient baseline instead of a flat absolute threshold, and
-#          (as of ADR-0005, extended by ADR-0006) a decline-from-peak trend —
-#          optionally gated by presence — instead of relying solely on an
-#          elapsed cooldown timer or a frozen absolute floor to confirm the
-#          session actually ended.
-# version: 1.4.0 (integrated into repo v1.7.0, ADR-0006)
+#          dynamic ambient baseline instead of a flat absolute threshold, a
+#          decline-from-peak trend (ADR-0005, extended to ACTIVE by ADR-0006)
+#          optionally gated by presence, and (ADR-0008) a baseline rebase at
+#          session end so a session starting shortly afterward doesn't
+#          inherit a stale pre-shower ambient reading.
+# version: 1.5.0 (integrated into repo v1.9.0, ADR-0008)
 # note:    Pure Python. No Home Assistant imports. Safe to unit-test and
 #          replay. ``presence`` is accepted as a plain Optional[bool] value
 #          the wiring layer already tracks — this file never touches HA.
@@ -247,9 +247,15 @@ class SessionDetector:
         """
         Time-based EMA so irregular sensor push intervals don't distort the
         smoothing — a 2s gap and a 10-minute gap are weighted correctly.
-        Not called while ACTIVE/COOLDOWN, so the baseline resumes tracking
-        (and naturally catches back up over time) once a session ends,
-        rather than needing an explicit reset.
+        Not called while ACTIVE/COOLDOWN. Before ADR-0008, this meant the
+        baseline stayed frozen at its pre-session value for the entire
+        session and only caught up to current conditions via this EMA once
+        IDLE resumed — a catch-up whose completeness depended on how long
+        the session had run (a short session left the baseline barely
+        moved). ADR-0008's rebase in ``_end_session`` now gives a session
+        ending an accurate, immediate baseline, so this EMA's job is
+        limited to what it's actually suited for: tracking gradual ambient
+        drift while genuinely idle, not undoing a stale freeze.
         """
         if self._baseline is None:
             self._baseline = humidity
@@ -327,7 +333,23 @@ class SessionDetector:
 
     def _end_session(self, humidity: float, now: datetime) -> StateChange:
         """Clear all session-scoped state and emit ENDED, from whichever
-        state (ACTIVE or COOLDOWN) the end was confirmed in."""
+        state (ACTIVE or COOLDOWN) the end was confirmed in.
+
+        ADR-0008: also rebases the ambient baseline to this exact reading —
+        instead of leaving it frozen at its stale pre-session value to
+        catch up unpredictably via ``_update_baseline``'s EMA on whatever
+        reading happens to arrive next. Without this, a session ending
+        while humidity is still well above true ambient (which ADR-0006
+        deliberately allows) leaves a second person's shower starting
+        shortly afterward measured against a baseline that's neither the
+        old pre-shower ambient nor the current room condition — sometimes
+        making their delta look artificially large (a stale-low baseline),
+        sometimes artificially permissive (an EMA catch-up landing close to
+        their own actual humidity). Rebasing here gives the same accuracy
+        guarantee RESUMED already provides for a sibling shower still
+        within the same COOLDOWN window, extended across the brief IDLE
+        gap to a shower that starts just after full ENDED.
+        """
         self._cooldown_start = None
         self._active_since = None
         self._active_since_humidity = None
@@ -335,6 +357,8 @@ class SessionDetector:
         self._peak_humidity = None
         self._decline_since = None
         self._presence_clear_since = None
+        self._baseline = humidity
+        self._baseline_updated_at = now
         return self._transition(SessionEvent.ENDED, SessionState.IDLE, humidity, now)
 
     def _from_active(

@@ -2,10 +2,12 @@
 # purpose: Tests for the Session Detection layer — dynamic ambient baseline
 #          replacing the flat absolute humidity threshold (v1.2, ADR-0004),
 #          decline/presence-confirmed session end from COOLDOWN (v1.3,
-#          ADR-0005), and the same presence-corroborated end firing
-#          directly from ACTIVE for sessions that never reach COOLDOWN
-#          (v1.4, ADR-0006).
-# version: 1.4.0
+#          ADR-0005), the same presence-corroborated end firing directly
+#          from ACTIVE for sessions that never reach COOLDOWN (v1.4,
+#          ADR-0006), and rebasing the ambient baseline to the ending
+#          reading at session end so a session starting shortly afterward
+#          doesn't inherit a stale pre-shower baseline (v1.5, ADR-0008).
+# version: 1.5.0
 # ---
 
 import sys
@@ -469,6 +471,94 @@ def test_regression_incident_stuck_active_session_now_ends():
 
 
 # ---------------------------------------------------------------------------
+# Baseline rebase at session end (ADR-0008) — a session ending while
+# humidity is still well above true ambient (which ADR-0006 deliberately
+# allows) must not leave a stale pre-shower baseline for the next session
+# to inherit; without a rebase, a second person's shower starting shortly
+# after could see an artificially inflated (or, less predictably,
+# artificially small) delta depending on how long the first session ran.
+# ---------------------------------------------------------------------------
+
+def test_end_session_rebases_baseline_to_ending_humidity():
+    """The instant a session ends, baseline_humidity snaps to that exact
+    reading — not the stale pre-session ambient it was frozen at."""
+    d = make_detector(start_delta=3.0, cooldown=300)
+    d.update(humidity=50.0, now=t(0))
+    d.update(humidity=50.0, now=t(700))  # baseline settles at 50.0
+    d.update(humidity=54.0, now=t(705))  # STARTED (threshold ~53.0)
+    change = d.update(humidity=50.0, now=t(1200))  # below threshold -> COOLDOWN
+    assert change is None
+    assert d.state is SessionState.COOLDOWN
+    change = d.update(humidity=50.0, now=t(1200 + 300))  # cooldown timeout -> ENDED
+    assert change is not None and change.event is SessionEvent.ENDED
+    assert d.baseline_humidity == 50.0  # matches ending humidity exactly
+
+
+def test_short_first_session_does_not_leave_stale_baseline_for_next_shower():
+    """The worst case under the old (pre-ADR-0008) behavior: a SHORT first
+    session, ending quickly, gave the EMA almost no time to catch the
+    baseline up on its own (dt too small for meaningful alpha) — leaving
+    the baseline stuck near the stale pre-shower ambient for whoever
+    showers next. With the rebase, session duration is irrelevant: the
+    baseline is exactly right immediately, regardless of how short the
+    first session was."""
+    d = make_detector(
+        start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60
+    )
+    d.update(humidity=50.0, now=t(0))
+    d.update(humidity=50.0, now=t(700))  # baseline settles at 50.0
+    d.update(humidity=54.0, now=t(705))  # STARTED
+    d.update(humidity=90.0, now=t(710), presence=False)  # rises fast, peak=90.0, decline/presence-clear accrual starts
+
+    # Ends via the ADR-0006 presence-corroborated path just 65 seconds after
+    # starting — about as short a session as this path allows.
+    change = d.update(humidity=85.0, now=t(775), presence=False)
+    assert change is not None
+    assert change.event is SessionEvent.ENDED
+
+    # Under the old logic, the baseline (dt only ~65-70s vs tau=600s) would
+    # have moved only a small fraction of the way from 50.0 toward 85.0.
+    # Under ADR-0008, it's exactly 85.0 regardless of the short duration.
+    assert d.baseline_humidity == 85.0
+
+
+def test_second_shower_gets_accurate_delta_after_first_ends_at_high_humidity():
+    """Regression test for the real-world concern this ADR fixes: a second
+    person showering shortly after the first session ends (while humidity
+    is still high) gets a delta baseline reflecting the ACTUAL current
+    room condition, not the first person's original pre-shower ambient —
+    so their own real humidity contribution is measured fairly, and a cut
+    only fires once THEY have genuinely raised humidity by
+    max_humidity_delta points above where the room actually was when they
+    started, not an inherited, artificially large gap."""
+    d = make_detector(start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60)
+    d.update(humidity=50.0, now=t(0))
+    d.update(humidity=50.0, now=t(700))  # baseline settles at 50.0
+    d.update(humidity=54.0, now=t(705))  # first session STARTED
+    d.update(humidity=90.0, now=t(760), presence=False)  # peak, decline/clear accrual starts
+
+    # First session ends via ADR-0006, humidity still very high (85.0).
+    change = d.update(humidity=85.0, now=t(825), presence=False)  # +65s clear
+    assert change is not None and change.event is SessionEvent.ENDED
+    assert d.baseline_humidity == 85.0
+
+    # A brief gap (residual humidity dissipating slightly) before the
+    # second person's shower genuinely starts.
+    d.update(humidity=82.0, now=t(900))  # still IDLE, baseline tracks down
+    baseline_before_second_start = d.baseline_humidity
+
+    # Second person's shower raises humidity well above wherever the
+    # baseline has tracked to by now — a real, fresh rise.
+    change = d.update(humidity=baseline_before_second_start + 5.0, now=t(910))
+    assert change is not None and change.event is SessionEvent.STARTED
+    # Their own delta baseline is the accurate recent reading (allowing for
+    # the small EMA nudge from this very triggering reading), not the stale
+    # 50.0 from hours earlier.
+    assert abs(d.active_since_humidity - baseline_before_second_start) < 0.5
+    assert d.active_since_humidity > 70.0  # nowhere near the stale 50.0
+
+
+# ---------------------------------------------------------------------------
 # active_since tracking
 # ---------------------------------------------------------------------------
 
@@ -551,6 +641,9 @@ if __name__ == "__main__":
         test_presence_true_does_not_end_session_from_active_even_with_decline,
         test_decline_alone_does_not_end_session_from_active_without_presence,
         test_regression_incident_stuck_active_session_now_ends,
+        test_end_session_rebases_baseline_to_ending_humidity,
+        test_short_first_session_does_not_leave_stale_baseline_for_next_shower,
+        test_second_shower_gets_accurate_delta_after_first_ends_at_high_humidity,
         test_active_since_none_when_idle,
         test_active_since_set_on_start,
         test_active_since_cleared_on_end,

@@ -1,0 +1,560 @@
+From b7020a82998f9d78058536f8df7e3f75ef9e8e6f Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.local>
+Date: Mon, 10 Aug 2026 00:27:20 +0000
+Subject: [PATCH] ADR-0008: rebase ambient baseline to the ending reading at
+ session end
+
+Fixes a real gap surfaced by inspection (not yet an observed incident,
+but demonstrated directly against real logged data): _baseline (the
+ADR-0004 ambient EMA tracker) is frozen the entire time a session is
+ACTIVE/COOLDOWN and only resumes updating once back in IDLE. Before
+ADR-0006 this was harmless -- a session could only reach IDLE once
+humidity had already decayed close to the frozen threshold, so the
+stale baseline and current humidity were already close together.
+ADR-0006 breaks that assumption: a session can now end via the
+presence-corroborated path while humidity is still far above true
+ambient (78%, 80% in the two incidents that motivated it).
+
+The EMA's catch-up from that stale value depends on dt -- roughly how
+long the just-ended session ran, not how long ago it ended, since the
+baseline was frozen throughout. Replaying the real incident #1 data
+shows this directly: baseline jumped from a stale 49.2 to 73.24 on the
+first post-IDLE reading, landing close to correct mostly by chance of
+that session having run ~20 minutes (large dt -> alpha near 1). A SHORT
+first session (e.g. an early ADR-0006 false-start catch within a couple
+of minutes) would produce a small dt and barely move the baseline at
+all, leaving a second person's real shower measured against a
+near-stale reference -- their modest actual rise could look like it
+already exceeds max_humidity_delta, cutting water almost immediately.
+The opposite failure (delayed STARTED detection) is also possible
+depending on exactly where the partial catch-up lands.
+
+This was concretely simulated: a synthetic "second shower right after
+the first ends" scenario, appended to incident #1's real trace, was
+replayed under both the old and new logic. Under the old logic the
+second shower's delta baseline is contaminated by the original stale
+49.2 ambient. Under the fix, it correctly reflects the accurate,
+recently-tracked room condition, and the second shower's cut only fires
+once ITS OWN humidity contribution genuinely exceeds max_humidity_delta
+above where the room actually was -- not an inherited gap.
+
+This mirrors and extends a guarantee the codebase already provides in a
+narrower case: RESUMED already resets active_since_humidity to the raw
+current reading (not the stale session-start baseline) specifically so
+a sibling shower during the same session's COOLDOWN window gets its own
+accurate baseline. This ADR extends that same accuracy guarantee across
+the brief IDLE gap once a session has fully ended, since ADR-0006 means
+that gap can now open while the room is still genuinely humid.
+
+Fix: _end_session() now sets self._baseline = humidity and
+self._baseline_updated_at = now, in addition to its existing
+session-scoped state cleanup. Applies uniformly regardless of which
+path ended the session (COOLDOWN's decline/timeout fallback, or
+ACTIVE's ADR-0006 presence-corroborated path) since all funnel through
+_end_session(). For a "normal" ending (humidity already near baseline),
+this rebase is a near no-op -- it only changes behavior for the case
+ADR-0006 specifically introduced.
+
+No new config keys. _update_baseline()'s ordinary EMA is unchanged --
+this only changes what it starts from.
+
+- session.py: _end_session() rebases _baseline / _baseline_updated_at.
+  Docstrings updated (module header, _update_baseline).
+- const.py / __init__.py / manifest.json: version bump only (1.9.0).
+- Tests: 3 new tests in test_session.py -- baseline snaps exactly to
+  the ending reading; a deliberately short first session (the old
+  logic's worst case) still gets an exact immediate correction
+  regardless of elapsed time; and a regression test simulating a second
+  shower starting shortly after the first ends at high humidity,
+  confirming its own delta baseline is accurate rather than inherited.
+  Full suite: 119 passed (116 previously passing + 3 new).
+- README.md / BACKLOG.md updated.
+
+See adr/ADR-0008-baseline-rebase-at-session-end.md for full rationale,
+including alternatives considered (scoping the rebase to only the
+ADR-0006 path; a shorter baseline_time_constant_seconds default
+instead; extending RESUMED's own mechanism across the IDLE gap).
+---
+ BACKLOG.md                                    |   4 +-
+ README.md                                     |  16 +-
+ ...ADR-0008-baseline-rebase-at-session-end.md | 163 ++++++++++++++++++
+ custom_components/shower_guard/__init__.py    |   2 +-
+ custom_components/shower_guard/const.py       |   4 +-
+ custom_components/shower_guard/manifest.json  |   2 +-
+ custom_components/shower_guard/session.py     |  44 +++--
+ tests/test_session.py                         | 101 ++++++++++-
+ 8 files changed, 315 insertions(+), 21 deletions(-)
+ create mode 100644 adr/ADR-0008-baseline-rebase-at-session-end.md
+
+diff --git a/BACKLOG.md b/BACKLOG.md
+index 8500a56..e284de5 100644
+--- a/BACKLOG.md
++++ b/BACKLOG.md
+@@ -1,7 +1,7 @@
+ # Shower Guard — Backlog
+ 
+-Features deferred beyond the current roadmap. All milestones through v1.8
+-(Presence Confirmation Latch) are complete — remaining work lives here
++Features deferred beyond the current roadmap. All milestones through v1.9
++(Baseline Rebase At Session End) are complete — remaining work lives here
+ until scheduled.
+ 
+ ---
+diff --git a/README.md b/README.md
+index cd76139..a38d6de 100644
+--- a/README.md
++++ b/README.md
+@@ -37,6 +37,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ | v1.6    | Decline-Confirmed Session End (ADR-0005) | ✅ Done |
+ | v1.7    | Presence-Corroborated End From ACTIVE (ADR-0006) | ✅ Done |
+ | v1.8    | Presence Confirmation Latch (ADR-0007) | ✅ Done |
++| v1.9    | Baseline Rebase At Session End (ADR-0008) | ✅ Done |
+ 
+ ## Installation
+ 
+@@ -44,7 +45,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
+ 2. Restart Home Assistant.
+ 3. Configure via `configuration.yaml` (see below).
+ 
+-## Configuration (v1.8)
++## Configuration (v1.9)
+ 
+ ```yaml
+ shower_guard:
+@@ -174,6 +175,19 @@ sibling's `RESUMED`) or when the session ends, and never overrides a genuine
+ humidity decline — it only matters while delta is still over threshold. See
+ ADR-0007 for the full rationale.
+ 
++**Baseline rebase at session end (v1.9, ADR-0008):** when a session ends,
++the ambient baseline now snaps immediately to the ending humidity reading,
++instead of staying frozen at its stale pre-shower value to catch up
++unpredictably via the normal EMA. This matters because ADR-0006 allows a
++session to end while humidity is still well above true ambient — without a
++rebase, a second person showering shortly after would have their own
++humidity delta measured against a baseline that could be anywhere from
++correct to badly stale, depending on how long the first session happened to
++run. With the rebase, a shower starting right after another one ends is
++always assessed fairly, on its own actual contribution. See ADR-0008 for the
++full rationale, including the back-to-back-shower scenario that surfaced
++this.
++
+ **Decision Logging (v0.4):** every Decision Engine evaluation — not just
+ changes — is recorded into a bounded, in-memory `DecisionLog`
+ (`decision_log_size` entries, oldest dropped first). This gives a structured
+diff --git a/adr/ADR-0008-baseline-rebase-at-session-end.md b/adr/ADR-0008-baseline-rebase-at-session-end.md
+new file mode 100644
+index 0000000..a47f0e1
+--- /dev/null
++++ b/adr/ADR-0008-baseline-rebase-at-session-end.md
+@@ -0,0 +1,163 @@
++# ADR-0008 — Rebase Ambient Baseline to the Ending Reading at Session End
++
++| Field     | Value                    |
++|-----------|--------------------------|
++| Status    | Accepted                 |
++| Date      | 2026-08-09               |
++| Author    | Technical Lead           |
++
++---
++
++## Context
++
++`SessionDetector._baseline` (the ambient EMA tracker, ADR-0004) is only
++updated while `IDLE` — `_update_baseline()` is never called during
++`ACTIVE`/`COOLDOWN`. Before ADR-0006, this was harmless: a session could
++only reach `IDLE` once humidity had already decayed close to the frozen
++`session_start_threshold`, so by the time tracking resumed, the stale
++pre-session baseline and the actual current humidity were already close
++together, and the EMA's catch-up was a minor correction.
++
++ADR-0006 deliberately breaks that assumption: a session can now end via the
++presence-corroborated path while humidity is still far above true ambient
++(78% and 80% in the two incidents that motivated ADR-0006). That leaves the
++baseline needing to "catch up" from a genuinely stale, pre-shower value
++toward a much higher current reading — and that catch-up happens through
++`_update_baseline()`'s time-based EMA on whatever reading happens to arrive
++first back in `IDLE`.
++
++The completeness of that catch-up depends on `dt`, the time since
++`_baseline_updated_at` was last touched — which is approximately **how long
++the just-ended session ran**, not how long ago it ended, since the baseline
++was frozen the entire time. This produces genuinely unpredictable behavior
++for whoever's next:
++
++- **A long preceding session** (the logged incidents ran ~20 minutes)
++  produces a large `dt`, so the EMA's `alpha` approaches 1 and the baseline
++  jumps most of the way to the current reading on the very first post-`IDLE`
++  update — happening to land close to correct, but only by accident of
++  session length.
++- **A short preceding session** (e.g. ADR-0006 catching an early false
++  start within a couple of minutes) produces a small `dt` and a small
++  `alpha`, leaving the baseline stuck near its stale pre-shower value. A
++  second person's real shower starting shortly after would then compute its
++  humidity delta against that stale low baseline — their actual, modest
++  rise could already look like a delta far past `max_humidity_delta`,
++  cutting their water almost immediately despite them having barely started.
++- The opposite failure is also possible: if the EMA catch-up happens to land
++  close to the second person's own actual humidity, their real rise might
++  not clear `humidity_start_delta` for a while, delaying `STARTED` detection
++  for their genuinely running shower.
++
++This was flagged as a concrete concern: two people showering back-to-back
++in the same bathroom (e.g. a sibling right after another), where the first
++session ends — possibly quickly, via ADR-0006 — while the room is still
++humid, and the second person's shower needs to be assessed on its own
++merits rather than inheriting an artifact of exactly how the first session's
++timing happened to interact with the baseline's EMA time constant.
++
++Notably, this exact class of problem — a fresh, accurate reference point
++needed for whoever showers next — was already solved once, for a narrower
++case: `RESUMED` (a sibling starting during the same session's `COOLDOWN`
++window) already resets `active_since_humidity` to the raw current reading,
++not the original session's stale start baseline, specifically so "a sibling
++starting a fresh shower during the cooldown window gets its own baseline
++rather than inheriting the previous person's cumulative rise." This ADR
++extends the same accuracy guarantee across the brief `IDLE` gap that occurs
++once a session has fully ended, rather than only within the same session's
++`COOLDOWN`.
++
++## Decision
++
++`_end_session()` now rebases the ambient baseline to the exact reading at
++the moment the session ends: `self._baseline = humidity` and
++`self._baseline_updated_at = now`, alongside the existing session-scoped
++state cleanup. This applies uniformly regardless of which path ended the
++session — the ADR-0006 presence-corroborated path from `ACTIVE`, the
++ADR-0005 decline-confirmed or presence-corroborated paths from `COOLDOWN`,
++or the original elapsed-timeout fallback — since all of them funnel through
++`_end_session()`.
++
++After the rebase, `_update_baseline()`'s ordinary time-based EMA resumes
++from that accurate starting point, tracking further ambient drift (e.g. the
++residual humidity continuing to dissipate) exactly as it's meant to. The
++fix doesn't change what the EMA does — only what it starts from.
++
++This means a session starting shortly after another one ended gets:
++
++1. **A correct `STARTED` trigger point** — `humidity_start_delta` above the
++   *actual* room condition when the previous session ended (and however it
++   has drifted since), not above a stale value from potentially hours
++   earlier.
++2. **A correct delta baseline** for the Decision Engine's cutoff —
++   `active_since_humidity` freezes to the (now-accurate) baseline at the
++   new session's start, so the new occupant's own humidity contribution is
++   what's measured against `max_humidity_delta`, not an inherited gap.
++
++No new configuration keys were introduced.
++
++### What changes
++
++| File         | Change |
++|--------------|--------|
++| `session.py` | `_end_session()` additionally sets `self._baseline` and `self._baseline_updated_at` to the ending reading. `_update_baseline()`'s docstring updated to describe the narrower role it now plays (ordinary idle-time drift tracking, not correcting a stale freeze). Module docstring updated. |
++| `const.py`, `__init__.py`, `manifest.json` | Version bump only (1.9.0) — no new config keys, no wiring changes. |
++| Tests | New tests in `test_session.py`: baseline snaps exactly to the ending reading; a deliberately *short* first session (the worst case under the old EMA-catch-up behavior) still produces an exact, immediate baseline correction regardless of how little time elapsed; and a regression test simulating a second shower starting shortly after the first ends at high humidity, confirming the second session's own delta baseline reflects the accurate current condition rather than the stale original ambient. |
++
++## Consequences
++
++- A second shower starting shortly after another ends now gets a fair,
++  accurate assessment of its own humidity contribution, regardless of how
++  long the first session ran or how it ended. Simulating the originally
++  reported concern (a session starting right after ADR-0006 ends one at
++  high humidity) confirms the fix: the second session's `STARTED` fires on
++  a genuine fresh rise, and its cut fires only once its own delta —
++  measured from the accurate, current baseline — genuinely exceeds
++  `max_humidity_delta`.
++- This also incidentally eliminates the harmless-but-confusing spurious
++  secondary `STARTED`/`ENDED` blip observed in the first ADR-0006 incident
++  replay (a brief second "session" a minute after the first one ended, an
++  artifact of the old partial EMA catch-up creating a residual gap just
++  over `humidity_start_delta`). That blip never represented real risk (no
++  cut ever fired during it), but its disappearance is a useful confirmation
++  the rebase is working as intended.
++- `_update_baseline()`'s EMA now only ever operates over genuinely idle
++  periods with no session in between, which is the condition its time
++  constant (`baseline_time_constant_seconds`, default 600s / 10 min) was
++  actually tuned for. Previously, that same time constant was implicitly
++  (and inconsistently) also governing "how fast do we recover from being
++  stale after a session," a job it was never designed for and could not do
++  reliably.
++- The rebase happens even for a session that ends the "normal" way (decline
++  already brought humidity close to the original baseline). In that case
++  the rebase is a near no-op — the ending reading is already close to what
++  the EMA would have converged to anyway — so this doesn't change behavior
++  for the common case, only the case ADR-0006 specifically introduced.
++
++## Alternatives Considered
++
++- **Only rebase when the session ended via the ADR-0006 ACTIVE-state path
++  (the specific case that introduced the risk), leaving COOLDOWN-based
++  endings on the old EMA-catch-up behavior** — Rejected as unnecessary
++  complexity. A COOLDOWN-based ending's rebase is a near no-op anyway (see
++  Consequences), so there's no behavioral cost to applying it uniformly,
++  and a single code path in `_end_session()` is simpler to reason about
++  than two.
++- **Increase `baseline_time_constant_seconds` responsiveness (a shorter
++  default) instead of rebasing** — Rejected. A shorter time constant speeds
++  up the EMA's catch-up generally, but doesn't fix the fundamental issue
++  that the catch-up's completeness is *tied to how long the previous
++  session ran* rather than being independent of it — it would narrow the
++  gap for long-session cases while barely helping the short-session worst
++  case, and would also make the baseline noisier during genuine idle
++  periods, which the existing 600s default was deliberately chosen to
++  smooth over.
++- **Extend `RESUMED`'s exact mechanism (reset on humidity crossing back
++  above a threshold) across the `IDLE` gap, rather than touching
++  `_baseline` at end-of-session** — Considered, but `RESUMED` only fires
++  from `COOLDOWN`, which requires still being in the same, not-yet-fully-
++  ended session. A session that's already reached `IDLE` (as ADR-0006 now
++  allows well before humidity is near ambient) has no `RESUMED`-equivalent
++  transition available; rebasing `_baseline` directly at `_end_session()`
++  is the natural analog for a session that has genuinely ended rather than
++  paused.
+diff --git a/custom_components/shower_guard/__init__.py b/custom_components/shower_guard/__init__.py
+index 4c35f25..6d62dd5 100644
+--- a/custom_components/shower_guard/__init__.py
++++ b/custom_components/shower_guard/__init__.py
+@@ -1,6 +1,6 @@
+ # ---
+ # purpose: Home Assistant integration entry point for Shower Guard.
+-# version: 1.8.0
++# version: 1.9.0
+ # note: Wires the Sensor Layer (humidity entity, optional presence entity)
+ #       into Session Detection and the Decision Engine, records every
+ #       decision into a bounded DecisionLog, and — when configured — calls
+diff --git a/custom_components/shower_guard/const.py b/custom_components/shower_guard/const.py
+index 06a82a8..9333572 100644
+--- a/custom_components/shower_guard/const.py
++++ b/custom_components/shower_guard/const.py
+@@ -1,11 +1,11 @@
+ # ---
+ # purpose: Central constants for the Shower Guard integration.
+-# version: 1.8.0
++# version: 1.9.0
+ # note: Add new constants here. Never scatter magic strings across modules.
+ # ---
+ 
+ DOMAIN = "shower_guard"
+-VERSION = "1.8.0"
++VERSION = "1.9.0"
+ 
+ # Session Detection (v1.5, ADR-0004)
+ # Session start is relative to a tracked ambient baseline, not a flat
+diff --git a/custom_components/shower_guard/manifest.json b/custom_components/shower_guard/manifest.json
+index 1dffa58..11a41cf 100644
+--- a/custom_components/shower_guard/manifest.json
++++ b/custom_components/shower_guard/manifest.json
+@@ -1,7 +1,7 @@
+ {
+ 	"domain": "shower_guard",
+ 	"name": "Shower Guard",
+-	"version": "1.8.0",
++	"version": "1.9.0",
+ 	"documentation": "https://github.com/algritz/shower_guard",
+ 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
+ 	"dependencies": [],
+diff --git a/custom_components/shower_guard/session.py b/custom_components/shower_guard/session.py
+index f9aab64..de074f8 100644
+--- a/custom_components/shower_guard/session.py
++++ b/custom_components/shower_guard/session.py
+@@ -1,12 +1,12 @@
+ # ---
+ # purpose: Session Detection layer — determines when a shower session starts,
+ #          continues, resumes, or ends based on humidity readings, using a
+-#          dynamic ambient baseline instead of a flat absolute threshold, and
+-#          (as of ADR-0005, extended by ADR-0006) a decline-from-peak trend —
+-#          optionally gated by presence — instead of relying solely on an
+-#          elapsed cooldown timer or a frozen absolute floor to confirm the
+-#          session actually ended.
+-# version: 1.4.0 (integrated into repo v1.7.0, ADR-0006)
++#          dynamic ambient baseline instead of a flat absolute threshold, a
++#          decline-from-peak trend (ADR-0005, extended to ACTIVE by ADR-0006)
++#          optionally gated by presence, and (ADR-0008) a baseline rebase at
++#          session end so a session starting shortly afterward doesn't
++#          inherit a stale pre-shower ambient reading.
++# version: 1.5.0 (integrated into repo v1.9.0, ADR-0008)
+ # note:    Pure Python. No Home Assistant imports. Safe to unit-test and
+ #          replay. ``presence`` is accepted as a plain Optional[bool] value
+ #          the wiring layer already tracks — this file never touches HA.
+@@ -247,9 +247,15 @@ class SessionDetector:
+         """
+         Time-based EMA so irregular sensor push intervals don't distort the
+         smoothing — a 2s gap and a 10-minute gap are weighted correctly.
+-        Not called while ACTIVE/COOLDOWN, so the baseline resumes tracking
+-        (and naturally catches back up over time) once a session ends,
+-        rather than needing an explicit reset.
++        Not called while ACTIVE/COOLDOWN. Before ADR-0008, this meant the
++        baseline stayed frozen at its pre-session value for the entire
++        session and only caught up to current conditions via this EMA once
++        IDLE resumed — a catch-up whose completeness depended on how long
++        the session had run (a short session left the baseline barely
++        moved). ADR-0008's rebase in ``_end_session`` now gives a session
++        ending an accurate, immediate baseline, so this EMA's job is
++        limited to what it's actually suited for: tracking gradual ambient
++        drift while genuinely idle, not undoing a stale freeze.
+         """
+         if self._baseline is None:
+             self._baseline = humidity
+@@ -327,7 +333,23 @@ class SessionDetector:
+ 
+     def _end_session(self, humidity: float, now: datetime) -> StateChange:
+         """Clear all session-scoped state and emit ENDED, from whichever
+-        state (ACTIVE or COOLDOWN) the end was confirmed in."""
++        state (ACTIVE or COOLDOWN) the end was confirmed in.
++
++        ADR-0008: also rebases the ambient baseline to this exact reading —
++        instead of leaving it frozen at its stale pre-session value to
++        catch up unpredictably via ``_update_baseline``'s EMA on whatever
++        reading happens to arrive next. Without this, a session ending
++        while humidity is still well above true ambient (which ADR-0006
++        deliberately allows) leaves a second person's shower starting
++        shortly afterward measured against a baseline that's neither the
++        old pre-shower ambient nor the current room condition — sometimes
++        making their delta look artificially large (a stale-low baseline),
++        sometimes artificially permissive (an EMA catch-up landing close to
++        their own actual humidity). Rebasing here gives the same accuracy
++        guarantee RESUMED already provides for a sibling shower still
++        within the same COOLDOWN window, extended across the brief IDLE
++        gap to a shower that starts just after full ENDED.
++        """
+         self._cooldown_start = None
+         self._active_since = None
+         self._active_since_humidity = None
+@@ -335,6 +357,8 @@ class SessionDetector:
+         self._peak_humidity = None
+         self._decline_since = None
+         self._presence_clear_since = None
++        self._baseline = humidity
++        self._baseline_updated_at = now
+         return self._transition(SessionEvent.ENDED, SessionState.IDLE, humidity, now)
+ 
+     def _from_active(
+diff --git a/tests/test_session.py b/tests/test_session.py
+index 408c75f..74fab63 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -2,10 +2,12 @@
+ # purpose: Tests for the Session Detection layer — dynamic ambient baseline
+ #          replacing the flat absolute humidity threshold (v1.2, ADR-0004),
+ #          decline/presence-confirmed session end from COOLDOWN (v1.3,
+-#          ADR-0005), and the same presence-corroborated end firing
+-#          directly from ACTIVE for sessions that never reach COOLDOWN
+-#          (v1.4, ADR-0006).
+-# version: 1.4.0
++#          ADR-0005), the same presence-corroborated end firing directly
++#          from ACTIVE for sessions that never reach COOLDOWN (v1.4,
++#          ADR-0006), and rebasing the ambient baseline to the ending
++#          reading at session end so a session starting shortly afterward
++#          doesn't inherit a stale pre-shower baseline (v1.5, ADR-0008).
++# version: 1.5.0
+ # ---
+ 
+ import sys
+@@ -468,6 +470,94 @@ def test_regression_incident_stuck_active_session_now_ends():
+     assert d.state is SessionState.IDLE
+ 
+ 
++# ---------------------------------------------------------------------------
++# Baseline rebase at session end (ADR-0008) — a session ending while
++# humidity is still well above true ambient (which ADR-0006 deliberately
++# allows) must not leave a stale pre-shower baseline for the next session
++# to inherit; without a rebase, a second person's shower starting shortly
++# after could see an artificially inflated (or, less predictably,
++# artificially small) delta depending on how long the first session ran.
++# ---------------------------------------------------------------------------
++
++def test_end_session_rebases_baseline_to_ending_humidity():
++    """The instant a session ends, baseline_humidity snaps to that exact
++    reading — not the stale pre-session ambient it was frozen at."""
++    d = make_detector(start_delta=3.0, cooldown=300)
++    d.update(humidity=50.0, now=t(0))
++    d.update(humidity=50.0, now=t(700))  # baseline settles at 50.0
++    d.update(humidity=54.0, now=t(705))  # STARTED (threshold ~53.0)
++    change = d.update(humidity=50.0, now=t(1200))  # below threshold -> COOLDOWN
++    assert change is None
++    assert d.state is SessionState.COOLDOWN
++    change = d.update(humidity=50.0, now=t(1200 + 300))  # cooldown timeout -> ENDED
++    assert change is not None and change.event is SessionEvent.ENDED
++    assert d.baseline_humidity == 50.0  # matches ending humidity exactly
++
++
++def test_short_first_session_does_not_leave_stale_baseline_for_next_shower():
++    """The worst case under the old (pre-ADR-0008) behavior: a SHORT first
++    session, ending quickly, gave the EMA almost no time to catch the
++    baseline up on its own (dt too small for meaningful alpha) — leaving
++    the baseline stuck near the stale pre-shower ambient for whoever
++    showers next. With the rebase, session duration is irrelevant: the
++    baseline is exactly right immediately, regardless of how short the
++    first session was."""
++    d = make_detector(
++        start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60
++    )
++    d.update(humidity=50.0, now=t(0))
++    d.update(humidity=50.0, now=t(700))  # baseline settles at 50.0
++    d.update(humidity=54.0, now=t(705))  # STARTED
++    d.update(humidity=90.0, now=t(710), presence=False)  # rises fast, peak=90.0, decline/presence-clear accrual starts
++
++    # Ends via the ADR-0006 presence-corroborated path just 65 seconds after
++    # starting — about as short a session as this path allows.
++    change = d.update(humidity=85.0, now=t(775), presence=False)
++    assert change is not None
++    assert change.event is SessionEvent.ENDED
++
++    # Under the old logic, the baseline (dt only ~65-70s vs tau=600s) would
++    # have moved only a small fraction of the way from 50.0 toward 85.0.
++    # Under ADR-0008, it's exactly 85.0 regardless of the short duration.
++    assert d.baseline_humidity == 85.0
++
++
++def test_second_shower_gets_accurate_delta_after_first_ends_at_high_humidity():
++    """Regression test for the real-world concern this ADR fixes: a second
++    person showering shortly after the first session ends (while humidity
++    is still high) gets a delta baseline reflecting the ACTUAL current
++    room condition, not the first person's original pre-shower ambient —
++    so their own real humidity contribution is measured fairly, and a cut
++    only fires once THEY have genuinely raised humidity by
++    max_humidity_delta points above where the room actually was when they
++    started, not an inherited, artificially large gap."""
++    d = make_detector(start_delta=3.0, decline_delta=1.0, presence_clear_confirm=60)
++    d.update(humidity=50.0, now=t(0))
++    d.update(humidity=50.0, now=t(700))  # baseline settles at 50.0
++    d.update(humidity=54.0, now=t(705))  # first session STARTED
++    d.update(humidity=90.0, now=t(760), presence=False)  # peak, decline/clear accrual starts
++
++    # First session ends via ADR-0006, humidity still very high (85.0).
++    change = d.update(humidity=85.0, now=t(825), presence=False)  # +65s clear
++    assert change is not None and change.event is SessionEvent.ENDED
++    assert d.baseline_humidity == 85.0
++
++    # A brief gap (residual humidity dissipating slightly) before the
++    # second person's shower genuinely starts.
++    d.update(humidity=82.0, now=t(900))  # still IDLE, baseline tracks down
++    baseline_before_second_start = d.baseline_humidity
++
++    # Second person's shower raises humidity well above wherever the
++    # baseline has tracked to by now — a real, fresh rise.
++    change = d.update(humidity=baseline_before_second_start + 5.0, now=t(910))
++    assert change is not None and change.event is SessionEvent.STARTED
++    # Their own delta baseline is the accurate recent reading (allowing for
++    # the small EMA nudge from this very triggering reading), not the stale
++    # 50.0 from hours earlier.
++    assert abs(d.active_since_humidity - baseline_before_second_start) < 0.5
++    assert d.active_since_humidity > 70.0  # nowhere near the stale 50.0
++
++
+ # ---------------------------------------------------------------------------
+ # active_since tracking
+ # ---------------------------------------------------------------------------
+@@ -551,6 +641,9 @@ if __name__ == "__main__":
+         test_presence_true_does_not_end_session_from_active_even_with_decline,
+         test_decline_alone_does_not_end_session_from_active_without_presence,
+         test_regression_incident_stuck_active_session_now_ends,
++        test_end_session_rebases_baseline_to_ending_humidity,
++        test_short_first_session_does_not_leave_stale_baseline_for_next_shower,
++        test_second_shower_gets_accurate_delta_after_first_ends_at_high_humidity,
+         test_active_since_none_when_idle,
+         test_active_since_set_on_start,
+         test_active_since_cleared_on_end,
+-- 
+2.43.0
+

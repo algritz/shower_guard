@@ -1,6 +1,6 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 1.8.0
+# version: 1.9.0
 # note: Wires the Sensor Layer (humidity entity, optional presence entity)
 #       into Session Detection and the Decision Engine, records every
 #       decision into a bounded DecisionLog, and — when configured — calls

@@ -1,7 +1,7 @@
 # Shower Guard — Backlog
 
-Features deferred beyond the current roadmap. All milestones through v1.8
-(Presence Confirmation Latch) are complete — remaining work lives here
+Features deferred beyond the current roadmap. All milestones through v1.9
+(Baseline Rebase At Session End) are complete — remaining work lives here
 until scheduled.
 
 ---

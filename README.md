@@ -37,6 +37,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 | v1.6    | Decline-Confirmed Session End (ADR-0005) | ✅ Done |
 | v1.7    | Presence-Corroborated End From ACTIVE (ADR-0006) | ✅ Done |
 | v1.8    | Presence Confirmation Latch (ADR-0007) | ✅ Done |
+| v1.9    | Baseline Rebase At Session End (ADR-0008) | ✅ Done |
 
 ## Installation
 
@@ -44,7 +45,7 @@ Sensor Layer → Session Detection → Decision Engine → Actuator
 2. Restart Home Assistant.
 3. Configure via `configuration.yaml` (see below).
 
-## Configuration (v1.8)
+## Configuration (v1.9)
 
 ```yaml
 shower_guard:
@@ -173,6 +174,19 @@ attended shower. The latch resets on a fresh baseline (a new `STARTED` or a
 sibling's `RESUMED`) or when the session ends, and never overrides a genuine
 humidity decline — it only matters while delta is still over threshold. See
 ADR-0007 for the full rationale.
+
+**Baseline rebase at session end (v1.9, ADR-0008):** when a session ends,
+the ambient baseline now snaps immediately to the ending humidity reading,
+instead of staying frozen at its stale pre-shower value to catch up
+unpredictably via the normal EMA. This matters because ADR-0006 allows a
+session to end while humidity is still well above true ambient — without a
+rebase, a second person showering shortly after would have their own
+humidity delta measured against a baseline that could be anywhere from
+correct to badly stale, depending on how long the first session happened to
+run. With the rebase, a shower starting right after another one ends is
+always assessed fairly, on its own actual contribution. See ADR-0008 for the
+full rationale, including the back-to-back-shower scenario that surfaced
+this.
 
 **Decision Logging (v0.4):** every Decision Engine evaluation — not just
 changes — is recorded into a bounded, in-memory `DecisionLog`
