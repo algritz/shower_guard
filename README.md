@@ -247,6 +247,23 @@ authoritative until explicitly superseded.
 pytest tests/
 ```
 
+### Diagnostic logging (temporary)
+
+`__init__.py` currently logs a DEBUG-level line on every single Decision
+Engine evaluation (not just decision changes) — `humidity`,
+`active_since_humidity`, the computed `delta`, `presence`, and
+`last_presence_at` — added to investigate a live discrepancy between
+expected and actual presence-confirmation behavior. Enable it via:
+
+```yaml
+logger:
+  logs:
+    custom_components.shower_guard: debug
+```
+
+Safe to remove once that investigation is resolved; it's pure logging, no
+behavior change.
+
 ## Non-Goals
 
 - Does not solve every home automation problem.

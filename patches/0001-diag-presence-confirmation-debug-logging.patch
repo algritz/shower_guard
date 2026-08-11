@@ -1,0 +1,213 @@
+From b10d469f47a3d679aae9a09a657a8c47ca7b1677 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.local>
+Date: Tue, 11 Aug 2026 10:55:08 +0000
+Subject: [PATCH] diag: add per-evaluation DEBUG log to investigate live
+ presence-confirmation gap
+
+Real-world data (son's shower, then a later multi-session day) shows the
+Decision Engine reaching delta >= max_humidity_delta (confirmed directly,
+since sensor.shower_guard_humidity_delta is published verbatim from
+result.humidity_delta -- proving the live evaluate() call entered that
+branch) without ever cutting water, even during a window where the
+presence sensor's exported history shows it was seemingly on shortly
+before/during the crossing. Meanwhile, ADR-0006's presence-corroborated
+session-end path (which requires the exact same underlying presence
+wiring) has fired correctly and repeatedly the same day.
+
+Existing logging can't distinguish these cases: __init__.py only logs a
+decision INFO line when the decision actually CHANGES, so a call that
+computes delta >= threshold but doesn't cut (presence unconfirmed)
+produces no log output at all -- indistinguishable from a call that
+never approached the threshold. There's no visibility into what
+`presence` / `last_presence_at` / the computed delta actually were on
+the specific call in question.
+
+This is diagnostic-only, no behavior change: _evaluate_and_record() now
+logs a DEBUG line on every single evaluation with the exact inputs
+(humidity, active_since_humidity, computed delta, presence,
+last_presence_at) and the resulting decision/reason. Enable via
+`logger: logs: custom_components.shower_guard: debug` in
+configuration.yaml. Intended to be removed once the underlying
+discrepancy is understood -- flagged as such in the code comment and
+README.
+
+- __init__.py: _evaluate_and_record() gains one _LOGGER.debug() call.
+  No other behavior changes.
+- const.py / manifest.json: version bump only (1.9.1) -- diagnostic
+  addition, not an architectural change, so no new ADR.
+- Tests: 1 new test in test_init.py using caplog to confirm the DEBUG
+  line fires on every evaluation with the expected fields. Full suite:
+  120 passed (119 previously passing + 1 new).
+- README.md: new "Diagnostic logging (temporary)" subsection under
+  Development, documenting how to enable it and that it's safe to
+  remove once resolved.
+---
+ README.md                                    | 17 +++++++++
+ custom_components/shower_guard/__init__.py   | 20 ++++++++++-
+ custom_components/shower_guard/const.py      |  4 +--
+ custom_components/shower_guard/manifest.json |  2 +-
+ tests/test_init.py                           | 37 ++++++++++++++++++--
+ 5 files changed, 73 insertions(+), 7 deletions(-)
+
+diff --git a/README.md b/README.md
+index a38d6de..0aa96b4 100644
+--- a/README.md
++++ b/README.md
+@@ -247,6 +247,23 @@ authoritative until explicitly superseded.
+ pytest tests/
+ ```
+ 
++### Diagnostic logging (temporary)
++
++`__init__.py` currently logs a DEBUG-level line on every single Decision
++Engine evaluation (not just decision changes) — `humidity`,
++`active_since_humidity`, the computed `delta`, `presence`, and
++`last_presence_at` — added to investigate a live discrepancy between
++expected and actual presence-confirmation behavior. Enable it via:
++
++```yaml
++logger:
++  logs:
++    custom_components.shower_guard: debug
++```
++
++Safe to remove once that investigation is resolved; it's pure logging, no
++behavior change.
++
+ ## Non-Goals
+ 
+ - Does not solve every home automation problem.
+diff --git a/custom_components/shower_guard/__init__.py b/custom_components/shower_guard/__init__.py
+index 6d62dd5..ddc256f 100644
+--- a/custom_components/shower_guard/__init__.py
++++ b/custom_components/shower_guard/__init__.py
+@@ -1,6 +1,6 @@
+ # ---
+ # purpose: Home Assistant integration entry point for Shower Guard.
+-# version: 1.9.0
++# version: 1.9.1
+ # note: Wires the Sensor Layer (humidity entity, optional presence entity)
+ #       into Session Detection and the Decision Engine, records every
+ #       decision into a bounded DecisionLog, and — when configured — calls
+@@ -253,6 +253,24 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+             presence=hass.data[DOMAIN]["presence"],
+             last_presence_at=hass.data[DOMAIN]["last_presence_at"],
+         )
++        # Diagnostic only (temporary) — logs the exact inputs behind every
++        # single evaluation, not just decision changes, so a live cut/no-cut
++        # call can be verified against real presence/latch state rather than
++        # inferred after the fact from the sparser INFO-level change log.
++        # Enable via `logger: logs: custom_components.shower_guard: debug`.
++        # Safe to remove once the presence-confirmation investigation this
++        # was added for is resolved.
++        _LOGGER.debug(
++            "Shower Guard eval: humidity=%s active_since_humidity=%s "
++            "delta=%s presence=%s last_presence_at=%s decision=%s reason=%s",
++            hass.data[DOMAIN]["last_humidity"],
++            detector.active_since_humidity,
++            result.humidity_delta,
++            hass.data[DOMAIN]["presence"],
++            hass.data[DOMAIN]["last_presence_at"],
++            result.decision.value,
++            result.reason,
++        )
+         decision_log.record(result)
+         _publish_decision_state(result, detector.active_since_humidity)
+         previous = hass.data[DOMAIN]["last_decision"]
+diff --git a/custom_components/shower_guard/const.py b/custom_components/shower_guard/const.py
+index 9333572..0ce47a9 100644
+--- a/custom_components/shower_guard/const.py
++++ b/custom_components/shower_guard/const.py
+@@ -1,11 +1,11 @@
+ # ---
+ # purpose: Central constants for the Shower Guard integration.
+-# version: 1.9.0
++# version: 1.9.1
+ # note: Add new constants here. Never scatter magic strings across modules.
+ # ---
+ 
+ DOMAIN = "shower_guard"
+-VERSION = "1.9.0"
++VERSION = "1.9.1"
+ 
+ # Session Detection (v1.5, ADR-0004)
+ # Session start is relative to a tracked ambient baseline, not a flat
+diff --git a/custom_components/shower_guard/manifest.json b/custom_components/shower_guard/manifest.json
+index 11a41cf..2f6c88e 100644
+--- a/custom_components/shower_guard/manifest.json
++++ b/custom_components/shower_guard/manifest.json
+@@ -1,7 +1,7 @@
+ {
+ 	"domain": "shower_guard",
+ 	"name": "Shower Guard",
+-	"version": "1.9.0",
++	"version": "1.9.1",
+ 	"documentation": "https://github.com/algritz/shower_guard",
+ 	"issue_tracker": "https://github.com/algritz/shower_guard/issues",
+ 	"dependencies": [],
+diff --git a/tests/test_init.py b/tests/test_init.py
+index 504ad32..ab6154c 100644
+--- a/tests/test_init.py
++++ b/tests/test_init.py
+@@ -4,10 +4,12 @@
+ #          (v1.0), the humidity-delta cutoff gated by presence confirmation
+ #          (v1.4, ADR-0003), the duration fallback (independent of presence,
+ #          off unless explicitly configured), decline/presence-confirmed
+-#          session end from COOLDOWN (v1.6, ADR-0005), and the same
++#          session end from COOLDOWN (v1.6, ADR-0005), the same
+ #          presence-corroborated end firing directly from ACTIVE (v1.7,
+-#          ADR-0006).
+-# version: 1.7.0
++#          ADR-0006), and a temporary per-evaluation DEBUG diagnostic log
++#          (v1.9.1) added to investigate a live presence-confirmation
++#          discrepancy — safe to remove once resolved.
++# version: 1.9.1
+ # ---
+ 
+ import asyncio
+@@ -417,6 +419,34 @@ def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold_with_p
+     assert last_decision.decision is Decision.WATER_CUT
+ 
+ 
++def test_evaluate_logs_diagnostic_debug_line_every_call(caplog):
++    """Every evaluation — not just decision changes — logs a DEBUG line with
++    the exact inputs (humidity, baseline, delta, presence, last_presence_at)
++    behind that call, so a live cut/no-cut decision can be verified against
++    real state rather than inferred from the sparser INFO-level change log."""
++    import logging as _logging
++
++    hass = make_hass()
++    captured = patch_track_state_change()
++
++    asyncio.run(
++        shower_guard.async_setup(
++            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
++        )
++    )
++
++    with caplog.at_level(_logging.DEBUG, logger="custom_components.shower_guard"):
++        event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
++        asyncio.run(captured["callback"](event))
++
++    diagnostic_lines = [r for r in caplog.records if "Shower Guard eval:" in r.message]
++    assert len(diagnostic_lines) == 1
++    msg = diagnostic_lines[0].message
++    assert "humidity=80.0" in msg
++    assert "presence=None" in msg
++    assert "decision=" in msg
++
++
+ def test_humidity_callback_does_not_cut_on_delta_alone_without_presence():
+     """Exceeding max_humidity_delta with no presence data at all (no
+     presence_sensor configured) does not cut water — the key behavior
+@@ -1319,6 +1349,7 @@ if __name__ == "__main__":
+         test_humidity_callback_ignores_missing_new_state,
+         test_humidity_callback_records_water_available_decision,
+         test_humidity_callback_records_water_cut_when_delta_exceeds_threshold_with_presence,
++        test_evaluate_logs_diagnostic_debug_line_every_call,
+         test_humidity_callback_does_not_cut_on_delta_alone_without_presence,
+         test_humidity_callback_records_every_evaluation_in_decision_log,
+         test_async_setup_registers_presence_listener_when_configured,
+-- 
+2.43.0
+

@@ -4,10 +4,12 @@
 #          (v1.0), the humidity-delta cutoff gated by presence confirmation
 #          (v1.4, ADR-0003), the duration fallback (independent of presence,
 #          off unless explicitly configured), decline/presence-confirmed
-#          session end from COOLDOWN (v1.6, ADR-0005), and the same
+#          session end from COOLDOWN (v1.6, ADR-0005), the same
 #          presence-corroborated end firing directly from ACTIVE (v1.7,
-#          ADR-0006).
-# version: 1.7.0
+#          ADR-0006), and a temporary per-evaluation DEBUG diagnostic log
+#          (v1.9.1) added to investigate a live presence-confirmation
+#          discrepancy — safe to remove once resolved.
+# version: 1.9.1
 # ---
 
 import asyncio
@@ -415,6 +417,34 @@ def test_humidity_callback_records_water_cut_when_delta_exceeds_threshold_with_p
 
     last_decision = hass.data[DOMAIN]["last_decision"]
     assert last_decision.decision is Decision.WATER_CUT
+
+
+def test_evaluate_logs_diagnostic_debug_line_every_call(caplog):
+    """Every evaluation — not just decision changes — logs a DEBUG line with
+    the exact inputs (humidity, baseline, delta, presence, last_presence_at)
+    behind that call, so a live cut/no-cut decision can be verified against
+    real state rather than inferred from the sparser INFO-level change log."""
+    import logging as _logging
+
+    hass = make_hass()
+    captured = patch_track_state_change()
+
+    asyncio.run(
+        shower_guard.async_setup(
+            hass, {DOMAIN: {"humidity_sensor": "sensor.bathroom_humidity"}}
+        )
+    )
+
+    with caplog.at_level(_logging.DEBUG, logger="custom_components.shower_guard"):
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state="80.0")})
+        asyncio.run(captured["callback"](event))
+
+    diagnostic_lines = [r for r in caplog.records if "Shower Guard eval:" in r.message]
+    assert len(diagnostic_lines) == 1
+    msg = diagnostic_lines[0].message
+    assert "humidity=80.0" in msg
+    assert "presence=None" in msg
+    assert "decision=" in msg
 
 
 def test_humidity_callback_does_not_cut_on_delta_alone_without_presence():
@@ -1319,6 +1349,7 @@ if __name__ == "__main__":
         test_humidity_callback_ignores_missing_new_state,
         test_humidity_callback_records_water_available_decision,
         test_humidity_callback_records_water_cut_when_delta_exceeds_threshold_with_presence,
+        test_evaluate_logs_diagnostic_debug_line_every_call,
         test_humidity_callback_does_not_cut_on_delta_alone_without_presence,
         test_humidity_callback_records_every_evaluation_in_decision_log,
         test_async_setup_registers_presence_listener_when_configured,

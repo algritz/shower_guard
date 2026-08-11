@@ -1,11 +1,11 @@
 # ---
 # purpose: Central constants for the Shower Guard integration.
-# version: 1.9.0
+# version: 1.9.1
 # note: Add new constants here. Never scatter magic strings across modules.
 # ---
 
 DOMAIN = "shower_guard"
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 
 # Session Detection (v1.5, ADR-0004)
 # Session start is relative to a tracked ambient baseline, not a flat

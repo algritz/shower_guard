@@ -1,6 +1,6 @@
 # ---
 # purpose: Home Assistant integration entry point for Shower Guard.
-# version: 1.9.0
+# version: 1.9.1
 # note: Wires the Sensor Layer (humidity entity, optional presence entity)
 #       into Session Detection and the Decision Engine, records every
 #       decision into a bounded DecisionLog, and — when configured — calls
@@ -252,6 +252,24 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             active_since_humidity=detector.active_since_humidity,
             presence=hass.data[DOMAIN]["presence"],
             last_presence_at=hass.data[DOMAIN]["last_presence_at"],
+        )
+        # Diagnostic only (temporary) — logs the exact inputs behind every
+        # single evaluation, not just decision changes, so a live cut/no-cut
+        # call can be verified against real presence/latch state rather than
+        # inferred after the fact from the sparser INFO-level change log.
+        # Enable via `logger: logs: custom_components.shower_guard: debug`.
+        # Safe to remove once the presence-confirmation investigation this
+        # was added for is resolved.
+        _LOGGER.debug(
+            "Shower Guard eval: humidity=%s active_since_humidity=%s "
+            "delta=%s presence=%s last_presence_at=%s decision=%s reason=%s",
+            hass.data[DOMAIN]["last_humidity"],
+            detector.active_since_humidity,
+            result.humidity_delta,
+            hass.data[DOMAIN]["presence"],
+            hass.data[DOMAIN]["last_presence_at"],
+            result.decision.value,
+            result.reason,
         )
         decision_log.record(result)
         _publish_decision_state(result, detector.active_since_humidity)
