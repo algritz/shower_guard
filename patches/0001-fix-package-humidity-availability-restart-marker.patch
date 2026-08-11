@@ -1,0 +1,131 @@
+From eaa41582cc2d04460438f9f0fe59524117d5b51d Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.local>
+Date: Tue, 11 Aug 2026 23:00:53 +0000
+Subject: [PATCH] fix(package): stop humidity template collapsing unavailable
+ to 0.0%, add restart marker
+
+Found while investigating what looked like a real session-detection
+incident: history.csv showed "ENDED (active -> idle, humidity=0.0%)"
+followed by a fresh STARTED six seconds later, which looked exactly
+like a sensor glitch tripping ADR-0006's decline-confirmed session end.
+
+It didn't. The 0.0% only ever existed in sensor.shower_guard_humidity
+(the *template* mirror), not in the raw sensor the Python integration
+actually reads. The template used `| float(0)`, so during the brief
+window a restart leaves the raw Zigbee sensor 'unavailable' (before
+it's re-polled), the template silently rendered a fabricated 0.0%
+instead of propagating unavailability. __init__.py's
+_handle_humidity_change already has its own _IGNORED_STATES guard on
+the raw sensor and would have correctly ignored the same 'unavailable'
+state -- so real session/decision behavior was never affected. Only
+this template's own recorded history was misleading, which is exactly
+what makes it worth fixing: anyone graphing Shower Guard Humidity
+(rather than the raw sensor directly) would see the same false dip and
+could draw the same wrong conclusion this investigation almost did.
+
+Fix: the template now uses `availability:` to propagate
+unknown/unavailable from the raw sensor instead of `| float(0)`
+silently substituting a physically implausible 0.0%.
+
+Also added sensor.shower_guard_last_restart (device_class: timestamp),
+a trigger-based template sensor that updates once on
+`homeassistant.start`. Pure history-graphing aid -- overlay it against
+Shower Guard Humidity to see at a glance whether a given reading dip
+correlates with a restart, instead of needing to dig through docker
+logs each time this comes up again.
+
+- src/packages/shower_guard.yaml: `availability:` added to the
+  "Shower Guard Humidity" template sensor; new trigger-based
+  "Shower Guard Last Restart" sensor added as its own template: list
+  entry (trigger-based sensors can't share a list item with
+  state-based ones). Header comment updated (v1.6.0) explaining both
+  changes and why the underlying Python integration was never at risk.
+- No Python changes -- this file is deployed by tools/deploy.sh
+  alongside custom_components/, but isn't part of the tested package.
+  Full pytest suite unaffected: 120 passed.
+---
+ src/packages/shower_guard.yaml | 47 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/src/packages/shower_guard.yaml b/src/packages/shower_guard.yaml
+index dc12d99..85269b9 100644
+--- a/src/packages/shower_guard.yaml
++++ b/src/packages/shower_guard.yaml
+@@ -2,7 +2,7 @@
+ #
+ # Shower Guard
+ #
+-# Version : 1.5.0
++# Version : 1.6.0
+ #
+ # Purpose
+ # -------
+@@ -19,6 +19,29 @@
+ # publishes, instead of re-deriving session state from a hardcoded humidity
+ # threshold.
+ #
++# v1.6: two fixes found while investigating a live incident.
++#
++# 1. "Shower Guard Humidity" used `| float(0)`, so a raw sensor reading of
++#    'unavailable' (e.g. during an HA restart, before the Zigbee sensor is
++#    re-polled) silently rendered as a literal 0.0% instead of propagating
++#    unavailability. A 0.0% reading is physically implausible for this
++#    sensor's placement and was mistaken, during investigation, for a real
++#    sensor glitch that had tripped ADR-0006's decline-confirmed session
++#    end — it hadn't; the actual Python integration reads the raw sensor
++#    directly and already ignores 'unknown'/'unavailable' via its own
++#    _IGNORED_STATES guard (see __init__.py), so this never affected real
++#    session/decision behavior. It only affected this template sensor's
++#    own history, which is what made it worth fixing: anyone graphing
++#    Shower Guard Humidity (rather than the raw sensor) would see the same
++#    misleading dip. Now uses `availability:` so the entity correctly goes
++#    unavailable instead of reporting a fabricated 0.0%.
++# 2. Added "Shower Guard Last Restart" (sensor.shower_guard_last_restart,
++#    device_class: timestamp), updated via a trigger-based template on the
++#    `homeassistant.start` event. Exists purely for history-graphing —
++#    overlay it against Shower Guard Humidity to see at a glance whether a
++#    given reading dip correlates with a restart, without needing to dig
++#    through logs each time.
++#
+ ###############################################################################
+ 
+ ###############################################################################
+@@ -55,6 +78,13 @@ template:
+         state_class: measurement
+         device_class: humidity
+         icon: mdi:water-percent
++        # v1.6: availability propagates the raw sensor's unavailable/unknown
++        # state instead of the old `| float(0)` silently rendering a
++        # physically implausible 0.0% (e.g. during an HA restart, before
++        # the Zigbee sensor is re-polled). See header note above.
++        availability: >
++          {{ states('sensor.bathroom_third_reality_inc_3rths0224z_humidity')
++             not in ['unknown', 'unavailable', 'none', ''] }}
+         state: >
+               {{ states('sensor.bathroom_third_reality_inc_3rths0224z_humidity') | float(0) | round(1) }}
+ 
+@@ -80,6 +110,21 @@ template:
+             on
+           {% endif %}
+ 
++  # v1.6: trigger-based sensor (not state-based like the ones above) that
++  # updates once, on the `homeassistant.start` event, to the time HA came
++  # up. Exists purely for history-graphing — overlay it against Shower
++  # Guard Humidity to see at a glance whether a reading dip correlates
++  # with a restart, rather than needing to dig through logs each time.
++  - trigger:
++      - platform: homeassistant
++        event: start
++    sensor:
++      - name: Shower Guard Last Restart
++        unique_id: shower_guard_last_restart
++        icon: mdi:restart
++        device_class: timestamp
++        state: "{{ now() }}"
++
+   - binary_sensor:
+ 
+       # Note: "Shower Guard Session Active" (binary_sensor.shower_guard_
+-- 
+2.43.0
+
